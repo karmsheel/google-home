@@ -22,6 +22,7 @@ __all__ = ["register", "PLUGIN_NAME", "PLATFORM_NAME", "__version__"]
 def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
     from .adapter import GoogleHomeAdapter, check_requirements, validate_config
+    from .cli import run_action, setup_cli
     from .platform_entry import build_platform_kwargs
     from .tools import register_tools
 
@@ -32,3 +33,14 @@ def register(ctx: Any) -> None:
         validate_config=validate_config,
     ))
     register_tools(ctx)
+    ctx.register_cli_command(
+        name="googlehome",
+        help="Google Home speaker bridge: check, devices, speak, status, firewall",
+        description=(
+            "Check that a Google Home / Nest speaker is reachable and can play audio "
+            "from this machine, list Cast devices, speak a phrase, read the running "
+            "bridge status, or open the media port in Windows Firewall."
+        ),
+        setup_fn=setup_cli,
+        handler_fn=run_action,
+    )
