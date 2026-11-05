@@ -1,0 +1,64 @@
+name: googlehome
+label: Google Home
+kind: platform
+version: 0.1.0
+author: karms
+description: >
+  Put a Google Home / Nest speaker on the other end of a Hermes profile's
+  conversation. Replies are synthesized with Hermes's own TTS stack and cast
+  to the speaker over the Cast v2 protocol (no third-party dependencies); voice
+  input arrives through the host microphone and Hermes's STT, and each turn is
+  routed to the profile you bind here. Adds googlehome_speak,
+  googlehome_status, googlehome_volume and googlehome_devices.
+homepage: https://github.com/NousResearch/hermes-agent
+requires_hermes: ">=0.21.5"
+manifest_version: 2
+python_dependencies: []
+provides_tools:
+  - googlehome_speak
+  - googlehome_status
+  - googlehome_volume
+  - googlehome_devices
+provides_hooks: []
+config_schema:
+  device:
+    type: str
+    default: ""
+    label: Speaker
+    description: >
+      IP address or friendly name of the speaker. Leave empty to use the first
+      audio-only Cast device found on the network.
+  profile:
+    type: str
+    default: ""
+    label: Hermes profile
+    description: >
+      Profile that answers voice turns. Empty means the profile the gateway is
+      already running (requires gateway.multiplex_profiles for other profiles).
+  volume:
+    type: int
+    default: 0
+    label: Speech volume (%)
+    description: >
+      Device volume to use while speaking (0-100). 0 leaves the speaker's own
+      volume untouched.
+  max_chars:
+    type: int
+    default: 1400
+    label: Spoken reply limit
+    description: Characters of a reply that are spoken; the rest stays in the chat.
+  tts_provider:
+    type: str
+    default: ""
+    label: TTS provider
+    description: Optional override of the profile's tts.provider for spoken replies.
+  control_port:
+    type: int
+    default: 8765
+    label: Desktop control port
+    description: Loopback port the Hermes Desktop extension connects to.
+  speak_replies:
+    type: bool
+    default: true
+    label: Speak replies
+    description: Cast every agent reply to the speaker.
