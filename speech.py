@@ -1,8 +1,11 @@
 """Turning agent replies into audio files, using Hermes's own TTS stack.
 
 The plugin deliberately does not bundle a speech engine: Hermes already has
-``text_to_speech_tool`` with a dozen providers, chunking, and the profile's
-configured voice. We call it and play the files it returns.
+``text_to_speech_tool`` with a dozen providers, long-text chunking, and the
+profile's configured voice. We call it and play the files it returns.
+
+A profile whose configured provider cannot speak (a paid provider with no key,
+say) still gets a voice: the free ``edge`` provider is tried next.
 """
 from __future__ import annotations
 
@@ -27,9 +30,13 @@ _TABLE_RULE = re.compile(r"^\s*\|?[\s:|-]{6,}\|?\s*$", re.MULTILINE)
 _EXTRA_SPACE = re.compile(r"[ \t]{2,}")
 _EXTRA_NEWLINES = re.compile(r"\n{3,}")
 
+#: Providers tried when the profile's own TTS provider cannot speak. ``edge`` is
+#: Hermes's free built-in, so a missing API key never leaves the speaker mute.
+FALLBACK_PROVIDERS = ("edge",)
+
 
 class TtsUnavailable(Exception):
-    """Hermes has no usable TTS provider configured."""
+    """No TTS provider could speak this text."""
 
 
 def flatten_for_speech(text: str, max_chars: int = 1400) -> str:
@@ -60,42 +67,7 @@ def flatten_for_speech(text: str, max_chars: int = 1400) -> str:
     return clipped.rstrip() + " …and more in the Hermes window."
 
 
-def synthesize(text: str, *, provider: str = "", timeout_hint: float = 60.0) -> list[str]:
-    """Synthesize ``text`` and return the local audio file paths.
-
-    Raises :class:`TtsUnavailable` when Hermes cannot speak at all, and
-    ``RuntimeError`` when the provider failed for this utterance.
-    """
-    text = (text or "").strip()
-    if not text:
-        return []
-    try:
-        from tools.tts_tool import check_tts_requirements, text_to_speech_tool
-    except Exception as exc:  # noqa: BLE001 - core import surface may move
-        raise TtsUnavailable(f"Hermes TTS tools are not importable: {exc}") from exc
-
-    if not check_tts_requirements():
-        raise TtsUnavailable(
-            "No TTS provider is configured. Set one with `hermes config` (tts.provider) "
-            "or `hermes setup`."
-        )
-
-    kwargs: dict[str, Any] = {"text": text}
-    if provider:
-        kwargs["provider"] = provider
-    try:
-        raw = text_to_speech_tool(**kwargs)
-    except Exception as exc:  # noqa: BLE001 - provider/network failures land here
-        raise RuntimeError(f"TTS synthesis failed: {exc}") from exc
-
-    try:
-        payload = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-    except (TypeError, ValueError):
-        payload = {"success": False, "error": str(raw)[:300]}
-
-    if not payload.get("success"):
-        raise RuntimeError(str(payload.get("error") or "TTS synthesis failed"))
-
+def _paths_from_payload(payload: dict[str, Any]) -> list[str]:
     candidates: list[str] = []
     for key in ("file_paths", "files"):
         value = payload.get(key)
@@ -113,10 +85,70 @@ def synthesize(text: str, *, provider: str = "", timeout_hint: float = 60.0) -> 
         seen.add(candidate)
         if Path(candidate).is_file():
             paths.append(candidate)
+    return paths
+
+
+def _attempt(text: str, provider: str) -> list[str]:
+    """One synthesis attempt with an explicit provider ('' = profile default)."""
+    from tools.tts_tool import text_to_speech_tool
+
+    kwargs: dict[str, Any] = {"text": text}
+    if provider:
+        kwargs["provider"] = provider
+    raw = text_to_speech_tool(**kwargs)
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    except (TypeError, ValueError):
+        payload = {"success": False, "error": str(raw)[:300]}
+
+    if not payload.get("success"):
+        raise RuntimeError(str(payload.get("error") or "synthesis failed"))
+
+    paths = _paths_from_payload(payload)
     if not paths:
         raise RuntimeError("TTS reported success but produced no audio file")
-    logger.debug("synthesized %d audio file(s) for %d chars", len(paths), len(text))
     return paths
+
+
+def synthesize(text: str, *, provider: str = "") -> list[str]:
+    """Synthesize ``text`` and return the local audio file paths.
+
+    Tries the requested provider (or the profile's configured one), then the
+    free built-ins. Raises :class:`TtsUnavailable` only when every attempt
+    failed, with each provider's reason included.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        from tools.tts_tool import text_to_speech_tool  # noqa: F401 - availability check
+    except Exception as exc:  # noqa: BLE001 - core import surface may move
+        raise TtsUnavailable(f"Hermes TTS tools are not importable: {exc}") from exc
+
+    candidates: list[str] = []
+    for candidate in (provider, *FALLBACK_PROVIDERS):
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    errors: list[str] = []
+    for index, candidate in enumerate(candidates):
+        label = candidate or "configured provider"
+        try:
+            paths = _attempt(text, candidate)
+        except RuntimeError as exc:
+            errors.append(f"{label}: {exc}")
+            logger.info("TTS via %s failed: %s", label, exc)
+            continue
+        if index > 0:
+            logger.info("TTS fell back to %s (the configured provider was unavailable)", label)
+        logger.debug("synthesized %d audio file(s) for %d chars", len(paths), len(text))
+        return paths
+
+    raise TtsUnavailable(
+        "No TTS provider could speak. "
+        + " | ".join(errors)
+        + ". Set one with `hermes config` (tts.provider); `edge` is free and needs no key."
+    )
 
 
 def describe_audio(path: str) -> dict[str, Any]:
