@@ -108,8 +108,10 @@ class _Handler(BaseHTTPRequestHandler):
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
+        # Record the fetch before streaming: the caller may observe these stats
+        # as soon as the body arrives, and a request already counts as served.
+        self._note(path.name, 206 if partial else 200)
         if self.command == "HEAD":
-            self._note(path.name, 206 if partial else 200)
             return
         with path.open("rb") as handle:
             handle.seek(start)
@@ -120,7 +122,6 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
-        self._note(path.name, 206 if partial else 200)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
         path = self._resolve()
