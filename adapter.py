@@ -508,10 +508,11 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             "last_spoken": self.last_spoken[-400:],
             "last_transcript": self.last_transcript[-400:],
         }
-        try:
-            payload["device"]["volume"] = await asyncio.to_thread(self._live_volume)
-        except castdevice.CastError:
-            pass
+        if self._device.get("host"):
+            try:
+                payload["device"]["volume"] = await asyncio.to_thread(self._live_volume)
+            except castdevice.CastError:
+                pass
         return payload
 
     def _live_volume(self) -> float:

@@ -203,35 +203,83 @@ def _query_interface(iface_ip: str, timeout: float) -> list[dict[str, Any]]:
         sock.close()
 
 
+def normalize(raw: dict[str, Any]) -> dict[str, Any]:
+    """Lift the interesting identity out of the TXT blob into top-level keys.
+
+    ``_query_interface`` returns raw records; everything downstream (naming,
+    audio-only selection, display) expects ``name``/``model``/``audio_only`` on
+    the dict itself, so there is exactly one place that does this.
+    """
+    device = dict(raw)
+    txt = device.get("txt") or {}
+    device.setdefault("id", "")
+    device["id"] = device["id"] or txt.get("id", "")
+    device["name"] = device.get("name") or txt.get("fn", "")
+    device["model"] = device.get("model") or txt.get("md", "")
+    if "capabilities" not in device:
+        try:
+            # ca is a capability bitmask: bit 2 (value 4) = AUDIO_OUT only.
+            device["capabilities"] = int(txt.get("ca", "0"))
+        except (TypeError, ValueError):
+            device["capabilities"] = 0
+    device["audio_only"] = device.get("audio_only", device["capabilities"] == 4)
+    device["address"] = device.get("address") or device.get("host", "")
+    device["port"] = device.get("port") or CAST_PORT
+    return device
+
+
+def is_cast_record(raw: dict[str, Any]) -> bool:
+    """True for a genuine Cast advertisement (not an unrelated mDNS answer)."""
+    txt = raw.get("txt") or {}
+    if txt.get("id"):
+        return True
+    return str(raw.get("service", "")).lower().endswith(CAST_SERVICE)
+
+
 def discover(timeout: float = 3.0) -> list[dict[str, Any]]:
-    """mDNS-discover Cast devices, probing each local interface in turn."""
+    """mDNS-discover Cast devices, querying every local interface concurrently.
+
+    Querying interfaces one after another multiplies the wall-clock cost by the
+    number of adapters (this host has four), which is long enough to blow a
+    status request's timeout. All interfaces share one discovery window instead.
+    """
     with _discovery_lock:
         interfaces = local_ipv4_addresses() or [""]
-        found: dict[str, dict[str, Any]] = {}
-        for iface_ip in interfaces:
+        results: list[dict[str, Any]] = []
+        lock = threading.Lock()
+
+        def worker(iface_ip: str) -> None:
             try:
-                for device in _query_interface(iface_ip, timeout):
-                    txt = device.get("txt", {})
-                    key = txt.get("id") or device.get("service", "")
-                    if not key:
-                        continue
-                    device["id"] = txt.get("id", "")
-                    device["name"] = txt.get("fn", "")
-                    device["model"] = txt.get("md", "")
-                    # ca is a capability bitmask: bit 2 (value 4) = AUDIO_OUT only.
-                    try:
-                        device["capabilities"] = int(txt.get("ca", "0"))
-                    except ValueError:
-                        device["capabilities"] = 0
-                    device["audio_only"] = device["capabilities"] == 4
-                    device["via_interface"] = iface_ip
-                    found[key] = device
+                found = _query_interface(iface_ip, timeout)
             except OSError as exc:
                 logger.debug("mDNS probe on %s failed: %s", iface_ip, exc)
-        return list(found.values())
+                return
+            with lock:
+                for device in found:
+                    device["via_interface"] = iface_ip
+                    results.append(device)
+
+        threads = [threading.Thread(target=worker, args=(ip,), daemon=True) for ip in interfaces]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + timeout + 1.0
+        for thread in threads:
+            thread.join(timeout=max(0.1, deadline - time.monotonic()))
+
+        merged: dict[str, dict[str, Any]] = {}
+        for device in results:
+            if not is_cast_record(device):
+                continue
+            device = normalize(device)
+            key = device["id"] or device.get("service", "")
+            if not key:
+                continue
+            merged[key] = device
+        return list(merged.values())
 
 
 def describe(device: dict[str, Any]) -> str:
+    device = normalize(device or {})
     name = device.get("name") or device.get("address") or "Cast device"
     model = device.get("model") or ""
     return f"{name} ({model})".strip() if model else name
@@ -270,7 +318,7 @@ def resolve_device(spec: str, *, timeout: float = 3.0) -> dict[str, Any]:
         except ValueError:
             pass
 
-    devices = discover(timeout=timeout)
+    devices = [normalize(device) for device in discover(timeout=timeout)]
     if not devices:
         if spec:
             return {"host": spec, "port": CAST_PORT, "name": spec, "model": "", "address": spec}

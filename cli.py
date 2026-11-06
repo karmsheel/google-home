@@ -247,7 +247,7 @@ def _status(args: Any) -> int:
         headers={"X-Hermes-Token": info.get("token", "")} if info.get("token") else {},
     )
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with urllib.request.urlopen(request, timeout=25) as response:
             print(json.dumps(json.loads(response.read().decode("utf-8")), indent=2, default=str))
     except Exception as exc:  # noqa: BLE001
         print(f"could not reach the bridge on port {info['port']}: {exc}")
