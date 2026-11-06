@@ -541,25 +541,27 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         self._drop_client()
         self._device = {}
         await self._refresh_device()
-        ctx = ghconfig.plugin_ctx()
-        if ctx is not None:
-            try:
-                ctx.set_config("device", self.settings.device)
-            except Exception:  # noqa: BLE001
-                pass
+        self._persist("device", self.settings.device)
         self._write_control_file()
         return await self.status()
 
     async def set_profile(self, name: str) -> dict[str, Any]:
         self.settings.profile = (name or "").strip()
-        ctx = ghconfig.plugin_ctx()
-        if ctx is not None:
-            try:
-                ctx.set_config("profile", self.settings.profile)
-            except Exception:  # noqa: BLE001
-                pass
+        self._persist("profile", self.settings.profile)
         self._write_control_file()
         return await self.status()
+
+    @staticmethod
+    def _persist(key: str, value: str) -> None:
+        """Write a UI choice through the plugin settings writer (best effort)."""
+        ctx = ghconfig.plugin_ctx()
+        if ctx is None:
+            logger.warning("[%s] no plugin context; %s=%r is session-only", PLATFORM_NAME, key, value)
+            return
+        try:
+            ctx.set_config(key, value)
+        except Exception as exc:  # noqa: BLE001 - persistence must not break the bridge
+            logger.warning("[%s] could not persist %s=%r: %s", PLATFORM_NAME, key, value, exc)
 
     # ── Desktop discovery file ───────────────────────────────────────────────
     def control_info(self) -> dict[str, Any]:

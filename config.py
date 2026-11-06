@@ -2,8 +2,10 @@
 
 Values resolve in this order, most specific first:
 
-1. ``platforms.googlehome.extra`` in the profile's ``config.yaml``
-2. the plugin's own Desktop settings (``plugins.entries.googlehome.settings.*``)
+1. the plugin's own settings (``plugins.entries.googlehome.settings.*``) — this
+   is what Hermes Desktop's Google Home page writes when you pick a speaker or a
+   profile, and what ``ctx.set_config`` persists
+2. ``platforms.googlehome.extra`` in the profile's ``config.yaml``
 3. ``GOOGLEHOME_*`` environment variables
 4. defaults below
 
@@ -103,67 +105,36 @@ def _first(*candidates: Any, default: Any = None) -> Any:
 
 
 def resolve_settings(config: Any = None) -> Settings:
-    """Build ``Settings`` from platform extra, plugin settings, env, defaults."""
-    extra = {}
+    """Build ``Settings``: plugin settings, then platform extra, then env."""
+    extra: dict = {}
     if config is not None:
         raw_extra = getattr(config, "extra", None)
         if isinstance(raw_extra, dict):
             extra = raw_extra
 
-    device = _first(extra.get("device"), _plugin_setting("device"), _env("device"), default="")
-    profile = _first(extra.get("profile"), _plugin_setting("profile"), _env("profile"), default="")
-    volume = _as_int(
-        _first(extra.get("volume"), _plugin_setting("volume"), _env("volume"), default=0), 0
-    )
-    tts_provider = _first(
-        extra.get("tts_provider"), _plugin_setting("tts_provider"), _env("tts_provider"), default=""
-    )
-    speech_backend = _first(
-        extra.get("speech_backend"), _plugin_setting("speech_backend"), _env("speech_backend"),
-        default="auto",
-    )
-    speech_voice = _first(
-        extra.get("speech_voice"), _plugin_setting("speech_voice"), _env("speech_voice"), default=""
-    )
-    max_chars = _as_int(
-        _first(extra.get("max_chars"), _plugin_setting("max_chars"), _env("max_chars"),
-               default=DEFAULT_MAX_CHARS),
-        DEFAULT_MAX_CHARS,
-    )
-    control_port = _as_int(
-        _first(extra.get("control_port"), _plugin_setting("control_port"), _env("control_port"),
-               default=DEFAULT_CONTROL_PORT),
-        DEFAULT_CONTROL_PORT,
-    )
-    media_port = _as_int(
-        _first(extra.get("media_port"), _plugin_setting("media_port"), _env("media_port"), default=0), 0
-    )
-    token_required = _as_bool(
-        _first(extra.get("token_required"), _plugin_setting("token_required"), _env("token_required")),
-        True,
-    )
-    speak_replies = _as_bool(
-        _first(extra.get("speak_replies"), _plugin_setting("speak_replies"), _env("speak_replies")),
-        True,
-    )
-    restore_volume = _as_bool(
-        _first(extra.get("restore_volume"), _plugin_setting("restore_volume"),
-               _env("restore_volume")),
-        True,
-    )
+    def pick(key: str, default: Any = None) -> Any:
+        """Desktop setting wins, then config.yaml extra, then environment."""
+        return _first(_plugin_setting(key), extra.get(key), _env(key), default=default)
+
+    volume = max(0, min(100, _as_int(pick("volume", 0), 0)))
+    max_chars = max(120, min(8000, _as_int(pick("max_chars", DEFAULT_MAX_CHARS),
+                                            DEFAULT_MAX_CHARS)))
+    control_port = _as_int(pick("control_port", DEFAULT_CONTROL_PORT), DEFAULT_CONTROL_PORT)
+    media_port = _as_int(pick("media_port", 0), 0)
+
     return Settings(
-        device=str(device).strip(),
-        profile=str(profile).strip(),
-        volume=max(0, min(100, volume)),
-        tts_provider=str(tts_provider).strip(),
-        speech_backend=str(speech_backend).strip().lower() or "auto",
-        speech_voice=str(speech_voice).strip(),
-        max_chars=max(120, min(8000, max_chars)),
+        device=str(pick("device", "") or "").strip(),
+        profile=str(pick("profile", "") or "").strip(),
+        volume=volume,
+        tts_provider=str(pick("tts_provider", "") or "").strip(),
+        speech_backend=(str(pick("speech_backend", "auto") or "auto").strip().lower() or "auto"),
+        speech_voice=str(pick("speech_voice", "") or "").strip(),
+        max_chars=max_chars,
         control_port=control_port,
         media_port=media_port,
-        token_required=token_required,
-        speak_replies=speak_replies,
-        restore_volume=restore_volume,
+        token_required=_as_bool(pick("token_required"), True),
+        speak_replies=_as_bool(pick("speak_replies"), True),
+        restore_volume=_as_bool(pick("restore_volume"), True),
         extra=extra,
     )
 

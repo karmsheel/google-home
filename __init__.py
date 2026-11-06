@@ -23,8 +23,14 @@ def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
     from .adapter import GoogleHomeAdapter, check_requirements, validate_config
     from .cli import run_action, setup_cli
+    from .config import remember_ctx
     from .platform_entry import build_platform_kwargs
     from .tools import register_tools
+
+    # The gateway builds the adapter from PlatformConfig alone, so stash the
+    # plugin context now: it is how the adapter reads Desktop settings and
+    # persists a device/profile chosen from the UI.
+    remember_ctx(ctx)
 
     ctx.register_platform(adapter_factory=GoogleHomeAdapter, **build_platform_kwargs(
         ctx=ctx,
