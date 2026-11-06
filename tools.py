@@ -93,7 +93,12 @@ def _speak(text: str, *, settings: Optional[ghconfig.Settings] = None) -> dict[s
         return {"ok": False, "error": "text is required"}
     spoken = speech.flatten_for_speech(text, settings.max_chars)
     try:
-        files = speech.synthesize(spoken, provider=settings.tts_provider)
+        files = speech.synthesize(
+            spoken,
+            provider=settings.tts_provider,
+            backend=settings.speech_backend,
+            voice=settings.speech_voice,
+        )
     except speech.TtsUnavailable as exc:
         return {"ok": False, "error": str(exc), "kind": "tts_unavailable"}
     except RuntimeError as exc:

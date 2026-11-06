@@ -335,7 +335,11 @@ class GoogleHomeAdapter(BasePlatformAdapter):
 
         try:
             files = await asyncio.to_thread(
-                speech.synthesize, text, provider=self.settings.tts_provider
+                speech.synthesize,
+                text,
+                provider=self.settings.tts_provider,
+                backend=self.settings.speech_backend,
+                voice=self.settings.speech_voice,
             )
         except speech.TtsUnavailable as exc:
             self.last_error = str(exc)
@@ -492,6 +496,12 @@ class GoogleHomeAdapter(BasePlatformAdapter):
                 "speak_replies": self.settings.speak_replies,
                 "max_chars": self.settings.max_chars,
                 "control_port": self.settings.control_port,
+                "speech_backend": self.settings.speech_backend,
+            },
+            "speech": {
+                "configured_backend": self.settings.speech_backend,
+                "last_backend": speech.last_backend(),
+                "voice": self.settings.speech_voice,
             },
             "media": self._media.stats,
             "last_error": self.last_error,

@@ -75,6 +75,8 @@ class Settings:
     profile: str = ""
     volume: int = 0
     tts_provider: str = ""
+    speech_backend: str = "auto"
+    speech_voice: str = ""
     max_chars: int = DEFAULT_MAX_CHARS
     control_port: int = DEFAULT_CONTROL_PORT
     media_port: int = 0
@@ -116,6 +118,13 @@ def resolve_settings(config: Any = None) -> Settings:
     tts_provider = _first(
         extra.get("tts_provider"), _plugin_setting("tts_provider"), _env("tts_provider"), default=""
     )
+    speech_backend = _first(
+        extra.get("speech_backend"), _plugin_setting("speech_backend"), _env("speech_backend"),
+        default="auto",
+    )
+    speech_voice = _first(
+        extra.get("speech_voice"), _plugin_setting("speech_voice"), _env("speech_voice"), default=""
+    )
     max_chars = _as_int(
         _first(extra.get("max_chars"), _plugin_setting("max_chars"), _env("max_chars"),
                default=DEFAULT_MAX_CHARS),
@@ -147,6 +156,8 @@ def resolve_settings(config: Any = None) -> Settings:
         profile=str(profile).strip(),
         volume=max(0, min(100, volume)),
         tts_provider=str(tts_provider).strip(),
+        speech_backend=str(speech_backend).strip().lower() or "auto",
+        speech_voice=str(speech_voice).strip(),
         max_chars=max(120, min(8000, max_chars)),
         control_port=control_port,
         media_port=media_port,

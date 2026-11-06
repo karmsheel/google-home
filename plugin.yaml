@@ -51,7 +51,26 @@ config_schema:
     type: str
     default: ""
     label: TTS provider
-    description: Optional override of the profile's tts.provider for spoken replies.
+    description: >
+      Optional override of the profile's tts.provider for spoken replies. Hermes
+      ignores an override that disagrees with tts.provider, so set tts.provider
+      itself to change the voice engine.
+  speech_backend:
+    type: str
+    default: auto
+    choices: [auto, hermes, sapi, edge]
+    label: Speech backend
+    description: >
+      auto tries Hermes TTS, then the offline Windows speech engine, then
+      edge-tts, and remembers what worked. hermes respects tts.provider only;
+      sapi is offline and keyless; edge needs network access.
+  speech_voice:
+    type: str
+    default: ""
+    label: Voice name
+    description: >
+      Optional voice for the sapi or edge backend, e.g. "Microsoft Zira Desktop"
+      or "en-US-AriaNeural". Empty uses the backend default.
   control_port:
     type: int
     default: 8765
