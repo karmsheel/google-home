@@ -31,7 +31,7 @@ def _direct_play(files: list[str], settings: ghconfig.Settings) -> dict[str, Any
     if not files:
         return {"ok": False, "error": "nothing to speak"}
     resolved = discovery.resolve_device(settings.device, timeout=3.0)
-    host = resolved.get("host") or resolved.get("address")
+    host = discovery.dial_host(resolved)
     if not host:
         return {
             "ok": False,
@@ -130,7 +130,7 @@ def _status(settings: ghconfig.Settings) -> dict[str, Any]:
             "media": adapter._media.stats,
         }
     resolved = discovery.resolve_device(settings.device, timeout=3.0)
-    host = resolved.get("host") or resolved.get("address")
+    host = discovery.dial_host(resolved)
     if not host:
         return {"ok": False, "via": "direct", "error": "no Cast device discovered",
                 "configured_device": settings.device}
@@ -165,7 +165,7 @@ def _handle_volume(args: dict[str, Any], **_kwargs: Any) -> str:
             adapter.settings.volume = level
             return json.dumps({"ok": True, "volume": level, "via": "gateway"})
         resolved = discovery.resolve_device(settings.device, timeout=3.0)
-        host = resolved.get("host") or resolved.get("address")
+        host = discovery.dial_host(resolved)
         if not host:
             return json.dumps({"ok": False, "error": "no Cast device discovered"})
         client = castdevice.CastClient(host, int(resolved.get("port") or 8009), timeout=8.0)

@@ -184,7 +184,7 @@ class GoogleHomeAdapter(BasePlatformAdapter):
                 "same network, or set its IP in the plugin settings."
             )
             return {}
-        host = resolved.get("host") or resolved.get("address")
+        host = discovery.dial_host(resolved)
         port = int(resolved.get("port") or 8009)
         resolved["host"] = host
         resolved["port"] = port
@@ -413,8 +413,12 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             user_id="speaker",
             user_name="Speaker",
         )
-        if self.settings.profile:
-            # Multiplexed gateways read this first when choosing a HERMES_HOME.
+        if self.settings.profile and not getattr(source, "profile", None):
+            # Newer Hermes resolves the profile from ``gateway.profile_routes``
+            # during build_source and keys the session's authority on it; a
+            # second, plugin-side stamp would disagree with that scope and the
+            # turn fails with RuntimeStoreError('profile_mismatch'). Only the
+            # unrouted case needs the legacy stamp.
             source.profile = self.settings.profile
 
         event = MessageEvent(

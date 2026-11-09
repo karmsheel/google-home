@@ -1,8 +1,25 @@
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
+# Local tooling and reference checkouts
 node_modules/
 tools/probe/node_modules/
+_ref/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime output
 *.log
+media/
+inbox/
+control.json
+control-token
+
+# Editors / OS
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db

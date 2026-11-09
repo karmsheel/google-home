@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from . import pysite
+
 logger = logging.getLogger(__name__)
 
 ENV_PREFIX = "GOOGLEHOME_"
@@ -104,6 +106,43 @@ def _first(*candidates: Any, default: Any = None) -> Any:
     return default
 
 
+_EXTRA_CACHE: dict[str, Any] = {"key": None, "value": {}}
+
+
+def config_file_extra() -> dict[str, Any]:
+    """``platforms.googlehome.extra`` from the active profile's config.yaml.
+
+    Only a fallback: the gateway hands the adapter a PlatformConfig carrying the
+    same block, while CLI commands and agent tools run without one and used to
+    ignore config.yaml altogether (so ``hermes googlehome check`` reported
+    "device: (auto)" on a pinned speaker).
+    """
+    path = hermes_home() / "config.yaml"
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if _EXTRA_CACHE["key"] == key:
+        return dict(_EXTRA_CACHE["value"])
+    try:
+        yaml = pysite.ensure_import("yaml")
+    except ImportError:  # pragma: no cover - Hermes always ships PyYAML
+        logger.debug("pyyaml unavailable; platforms.googlehome.extra ignored")
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError) as exc:
+        logger.warning("could not read %s: %s", path, exc)
+        return {}
+    platforms = data.get("platforms") if isinstance(data, dict) else None
+    entry = platforms.get("googlehome") if isinstance(platforms, dict) else None
+    extra = entry.get("extra") if isinstance(entry, dict) else None
+    value = dict(extra) if isinstance(extra, dict) else {}
+    _EXTRA_CACHE.update({"key": key, "value": value})
+    return dict(value)
+
+
 def resolve_settings(config: Any = None) -> Settings:
     """Build ``Settings``: plugin settings, then platform extra, then env."""
     extra: dict = {}
@@ -111,6 +150,12 @@ def resolve_settings(config: Any = None) -> Settings:
         raw_extra = getattr(config, "extra", None)
         if isinstance(raw_extra, dict):
             extra = raw_extra
+    else:
+        # No PlatformConfig: this is the CLI/tool path, where the gateway has
+        # not handed us one. Read the same ``platforms.googlehome.extra`` block
+        # out of config.yaml so ``hermes googlehome check`` agrees with the
+        # adapter instead of silently falling back to auto-discovery.
+        extra = config_file_extra()
 
     def pick(key: str, default: Any = None) -> Any:
         """Desktop setting wins, then config.yaml extra, then environment."""

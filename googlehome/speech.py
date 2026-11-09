@@ -30,6 +30,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from . import pysite
+
 logger = logging.getLogger(__name__)
 
 _CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
@@ -213,11 +215,16 @@ def _synth_sapi(text: str, provider: str, voice: str) -> list[str]:
 
 
 # ── backend: edge (network, keyless) ────────────────────────────────────────
-def _synth_edge(text: str, provider: str, voice: str) -> list[str]:
+def _import_edge_tts() -> Any:
+    """Import ``edge_tts``, repairing a launcher ``sys.path`` that dropped site-packages."""
     try:
-        import edge_tts
+        return pysite.ensure_import("edge_tts")
     except ImportError as exc:
-        raise RuntimeError("the edge-tts package is not installed") from exc
+        raise RuntimeError(f"the edge-tts package is not installed ({exc!r})") from exc
+
+
+def _synth_edge(text: str, provider: str, voice: str) -> list[str]:
+    edge_tts = _import_edge_tts()
 
     work = Path(tempfile.gettempdir()) / "hermes-googlehome-tts"
     work.mkdir(parents=True, exist_ok=True)

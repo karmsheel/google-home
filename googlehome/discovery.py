@@ -219,10 +219,13 @@ def normalize(raw: dict[str, Any]) -> dict[str, Any]:
     if "capabilities" not in device:
         try:
             # ca is a capability bitmask: bit 2 (value 4) = AUDIO_OUT only.
+            # Real firmware also sets high undocumented bits (a Home Mini
+            # reports 199172), so this is a mask test, never equality.
             device["capabilities"] = int(txt.get("ca", "0"))
         except (TypeError, ValueError):
             device["capabilities"] = 0
-    device["audio_only"] = device.get("audio_only", device["capabilities"] == 4)
+    capabilities = device["capabilities"]
+    device["audio_only"] = device.get("audio_only", bool(capabilities & 4) and not bool(capabilities & 1))
     device["address"] = device.get("address") or device.get("host", "")
     device["port"] = device.get("port") or CAST_PORT
     return device
@@ -335,3 +338,18 @@ def resolve_device(spec: str, *, timeout: float = 3.0) -> dict[str, Any]:
         logger.warning("no Cast device matched %r; using %s", spec, describe(devices[0]))
     audio_only = [d for d in devices if d.get("audio_only")]
     return (audio_only or devices)[0]
+
+
+def dial_host(device: dict[str, Any]) -> str:
+    """The address to open a socket to: an IP literal wins over a hostname.
+
+    A Cast SRV target is ``<uuid>.local``, and a Windows host has no resolver
+    for that name, so dialling the hostname fails even though the same mDNS
+    answer carried the A record with the address we actually need.
+    """
+    address = str(device.get("address") or "").strip()
+    try:
+        ipaddress.ip_address(address)
+        return address
+    except ValueError:
+        return str(device.get("host") or address).strip()

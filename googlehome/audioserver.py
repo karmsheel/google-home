@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import re
+import socket
 import threading
 import time
 from http import HTTPStatus
@@ -138,6 +139,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
 
+class _MediaHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer, but a busy port fails instead of being hijacked.
+
+    ``HTTPServer.allow_reuse_address`` is true by default, and on Windows
+    ``SO_REUSEADDR`` lets a second process bind a port that is already
+    listening. Two media servers on 8766 then split the device's fetches: the
+    bridge serves the file, the other server's counter stays 0, and a perfectly
+    healthy bridge gets reported as a firewall problem. Exclusive binding makes
+    that collision an honest ``OSError``.
+    """
+
+    if os.name == "nt":  # pragma: no cover - platform behaviour
+        allow_reuse_address = False
+
+        def server_bind(self) -> None:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
 class MediaServer:
     """Serves generated audio files to Cast devices on the LAN."""
 
@@ -151,7 +171,7 @@ class MediaServer:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> int:
-        httpd = ThreadingHTTPServer(("0.0.0.0", self.requested_port), _Handler)
+        httpd = _MediaHTTPServer(("0.0.0.0", self.requested_port), _Handler)
         httpd.daemon_threads = True
         httpd.media_root = self.media_root  # type: ignore[attr-defined]
         httpd.request_count = 0  # type: ignore[attr-defined]

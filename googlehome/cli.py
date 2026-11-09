@@ -96,7 +96,7 @@ def _check(args: Any) -> int:
     _print_devices(devices)
 
     resolved = discovery.resolve_device(settings.device, timeout=3.0)
-    host = resolved.get("host") or resolved.get("address")
+    host = discovery.dial_host(resolved)
     report: dict[str, Any] = {
         "configured_device": settings.device,
         "discovered": devices,
@@ -144,9 +144,19 @@ def _check(args: Any) -> int:
                           advertise_host=local_ip)
     client = castdevice.CastClient(host, int(resolved.get("port") or 8009), timeout=8.0)
     try:
-        port = library.start()
+        try:
+            port = library.start()
+            note = ""
+        except OSError:
+            # The running bridge already owns the pinned port. Two servers on
+            # one port split the device's fetches, so this check would count
+            # zero on its own server and blame a firewall that is fine.
+            library.stop()
+            library = MediaServer(ghconfig.media_dir(), port=0, advertise_host=local_ip)
+            port = library.start()
+            note = f"  (port {settings.media_port} is busy — the bridge is serving it)"
         report["media_port"] = port
-        print(f"4. Media server: listening on {local_ip}:{port}")
+        print(f"4. Media server: listening on {local_ip}:{port}{note}")
         client.connect()
         filename = library.publish(str(tone))
         result = client.play_and_wait(

@@ -16,6 +16,7 @@ import socket
 import ssl
 import threading
 import time
+import uuid
 from typing import Any, Callable, Optional
 
 from . import castproto as p
@@ -51,13 +52,16 @@ class CastClient:
         port: int = 8009,
         *,
         timeout: float = DEFAULT_TIMEOUT,
-        source_id: str = "sender-0",
+        source_id: str = "",
         heartbeat: bool = True,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.source_id = source_id
+        # A sender id is a session identity: two clients for the same device
+        # (the live bridge plus ``hermes googlehome check``) must never share
+        # one, or the receiver closes the duplicate with a CONNECT close.
+        self.source_id = source_id or f"sender-{uuid.uuid4().hex[:8]}"
         self._heartbeat_enabled = heartbeat
 
         self._sock: Optional[ssl.SSLSocket] = None
@@ -274,6 +278,11 @@ class CastClient:
         info = self.summarize_status(self.get_status(timeout=timeout))
         if info.get("app_id") == p.DEFAULT_MEDIA_RECEIVER and info.get("transport_id"):
             self._transport_id = str(info["transport_id"])
+            # The app may already be running (another sender launched it, or an
+            # earlier session left it up). The virtual channel to the transport
+            # still has to be opened: a LOAD on an unconnected transport makes
+            # the receiver close the sender's connection outright.
+            self._send(p.NS_CONNECTION, self._transport_id, {"type": p.MSG_CONNECT})
             return self._transport_id
 
         request_id = self._next_request_id()
@@ -352,9 +361,11 @@ class CastClient:
             return {}
         request_id = self._next_request_id()
         self._send(p.NS_MEDIA, transport_id, {"type": "GET_STATUS", "requestId": request_id})
+        # Any MEDIA_STATUS will do: real receivers do not always echo our
+        # requestId (and some push an unsolicited status instead), so matching
+        # on it exactly is how a poll silently burns its whole timeout.
         reply = self._await(
-            lambda payload: payload.get("type") == "MEDIA_STATUS"
-            and payload.get("requestId") in (None, request_id),
+            lambda payload: payload.get("type") == "MEDIA_STATUS",
             timeout=timeout,
             description="MEDIA_STATUS",
         )
@@ -391,18 +402,30 @@ class CastClient:
         if started.get("media_session_id") is None:
             return started
         deadline = time.monotonic() + max_wait
+        duration = started.get("duration")
+        if isinstance(duration, (int, float)) and duration > 0:
+            # A known duration is a real upper bound; waiting past it only adds
+            # latency to every voice turn.
+            deadline = min(deadline, time.monotonic() + float(duration) + 4.0)
         saw_playing = started.get("player_state") == "PLAYING"
         while time.monotonic() < deadline:
-            time.sleep(0.5)
+            time.sleep(0.4)
             try:
-                status = self.get_media_status(timeout=3.0)
+                status = self.get_media_status(timeout=2.0)
             except CastError:
                 break
             state = status.get("playerState")
             if state == "PLAYING":
                 saw_playing = True
-            elif state == "IDLE" and (saw_playing or status.get("idleReason") in {"FINISHED", "ERROR"}):
-                return {**started, "finished": True, "idle_reason": status.get("idleReason")}
+                continue
+            if state == "IDLE":
+                if saw_playing or status.get("idleReason") in {"FINISHED", "ERROR"}:
+                    return {**started, "finished": True, "idle_reason": status.get("idleReason")}
+                continue
+            # No session at all: the receiver dropped the app after the clip,
+            # which for our purposes is the same outcome as IDLE/FINISHED.
+            if not status and saw_playing:
+                return {**started, "finished": True, "idle_reason": "FINISHED"}
         return {**started, "finished": False}
 
 
