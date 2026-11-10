@@ -9,8 +9,8 @@ documentation and teardown write-ups, cited inline.
 
 ## 1. Finding it on the network
 
-**verified** — `tools/probe/mdns_cast.py` implements a pure-stdlib mDNS query and
-was used to probe this LAN.
+**verified** — `discovery.py` implements a pure-stdlib mDNS query (no
+`zeroconf`, no `dnspython`) and was used to probe this LAN.
 
 Cast devices advertise `_googlecast._tcp.local` over mDNS (UDP 5353,
 `224.0.0.251`). The TXT record carries the identity:
@@ -41,7 +41,7 @@ Two operational notes learned the hard way on this machine:
    query only leaves one of them. `discovery.discover()` therefore probes every
    local IPv4 address in turn (`IP_MULTICAST_IF`).
 2. **mDNS can fail while the device is still reachable.** A unicast TCP sweep for
-   port 8009 is the reliable fallback (`tools/probe/scan.js`).
+   port 8009 is the reliable fallback.
 
 Identity beyond mDNS lives on an unauthenticated HTTPS endpoint on **8443**:
 
@@ -274,10 +274,8 @@ namespaces: `GET_STATUS`, `LAUNCH`, `LOAD`, `SET_VOLUME`, `STOP`, heartbeats, an
 client against it, so the protocol implementation is verified on every run
 without a speaker present.
 
-Live probes used during the investigation:
-
-```bash
-python tools/probe/mdns_cast.py 5      # per-interface mDNS discovery
-node   tools/probe/scan.js 192.168.1 8009 400   # unicast sweep for port 8009
-node   tools/probe/discover.js 12      # bonjour-service cross-check
-```
+The investigation itself used throwaway probes — a per-interface mDNS query, a
+unicast sweep of port 8009, and a `bonjour-service` cross-check on the same LAN.
+They were scratch scripts, not shipped code: `discovery.py` carries the mDNS
+implementation the plugin actually uses, so the findings above stay reproducible
+from the repository alone.

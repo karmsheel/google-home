@@ -1,6 +1,5 @@
 # Local tooling and reference checkouts
 node_modules/
-tools/probe/node_modules/
 _ref/
 
 # Python

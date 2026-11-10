@@ -284,7 +284,6 @@ googlehome/                 the installable plugin
   tools.py                  googlehome_* tools
   desktop/plugin.js         Desktop extension (plain ESM, no build)
 tests/                      protocol, media server, adapter, Desktop harness
-tools/probe/                live probes used during reverse engineering
 docs/REVERSE_ENGINEERING.md protocol findings and the microphone wall
 ```
 
