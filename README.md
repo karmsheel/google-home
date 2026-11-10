@@ -1,8 +1,9 @@
 # Hermes ⇄ Google Home
 
-A Hermes Agent plugin (plus a Hermes Desktop extension) that puts a Google Home /
-Nest speaker on the other end of a Hermes profile's conversation: you talk, a
-profile answers, the speaker says it out loud.
+A Hermes Agent plugin (plus a Hermes Desktop extension) that puts a **Google Home
+Mini** — or any Cast-only Google Home / Nest speaker — on the other end of a
+Hermes profile's conversation: you talk, a profile answers, the speaker says it
+out loud.
 
 - **Agent plugin** (`googlehome/`) — a `kind: platform` gateway adapter. Replies are
   synthesized with Hermes's own TTS stack and cast to the device over the Cast v2
@@ -64,7 +65,7 @@ Two details that matter:
 ### 1. Agent plugin
 
 ```bash
-hermes plugins install file:///C:/Users/you/Projects/googlehome-mini/googlehome --enable
+hermes plugins install file:///C:/Users/you/Projects/google-home/googlehome --enable
 ```
 
 (or copy `googlehome/` into `%HERMES_HOME%\plugins\` and `hermes plugins enable googlehome`)
