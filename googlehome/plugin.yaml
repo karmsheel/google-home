@@ -35,10 +35,12 @@ config_schema:
   profile:
     type: str
     default: ""
-    label: Hermes profile
+    label: Fallback profile
     description: >
-      Profile that answers voice turns. Empty means the profile the gateway is
-      already running (requires gateway.multiplex_profiles for other profiles).
+      Legacy fallback for an install with no gateway.profile_routes entry.
+      When a route names a profile, it wins for both the turn and the adapter's
+      TTS credentials; this setting cannot override it. The Desktop page shows
+      the routed profile as a read-only Answered by row.
   volume:
     type: int
     default: 0

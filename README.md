@@ -217,18 +217,26 @@ hermes googlehome firewall        # open the media port (UAC prompt)
     composer. The popover is the way back, so the choice is never stranded.
   While audio is playing the chip is **⏹ stop** as before, and the page stays
   reachable from the sidebar (Google Home) and ⌘K → "Open Google Home bridge".
+- **The page is a bridge control, not a profile page.** The Desktop extension is
+  one global file, and the page can stop, mute, and push-to-talk from any
+  profile. It names its owner: `bridge: <profile>` when routing sends turns
+  elsewhere, and a line explaining when the profile you are viewing does not
+  have the plugin (the page still controls the bridge in its own profile).
 - **The same controls are on the page.** The bottom of the Google Home page is
-  one two-column settings section: the **Speaker** and **Hermes profile** rows
+  one two-column settings section: the **Speaker** and **Answered by** rows
   in their own box on the left, and the **Speaker controls** box — volume,
   **Mute speaker**, **Hide composer picker** — on the right. Both boxes share
   the same elevated surface and stretch to the same height, so the section reads
-  as one block. The routing rows are compact: each picker sits on
-  its option's title line, and the one-line explanations moved into hover tips,
-  so the left box does not tower over the controls. The page column is padded
+  as one block. The Speaker row keeps its picker on the title line; Answered by
+  is a read-only chip, because `gateway.profile_routes` is the authority. The
+  one-line explanations moved into hover tips, so the left box does not tower
+  over the controls. The page column is padded
   (`px-12`) and its width is `min(50% + 24rem, 88rem)`, which halves the side
   gutters of a 48rem column at every window size.
-- **Composer control**: every conversation gets a **Speaker** picker beside the
-  model selector — point that chat at a speaker, or Off. See
+- **Composer control**: conversations in a profile where this plugin is enabled
+  get a **Speaker** picker beside the model selector — point that chat at a
+  speaker, or Off. It is absent in profiles without the plugin, because no
+  turn-end hook would read the choice. See
   [One conversation, one speaker](#one-conversation-one-speaker). Hide it from
   the status-bar chip's popover if the composer is tight.
 - **From the agent**: the `googlehome` toolset —
@@ -245,7 +253,8 @@ hermes googlehome firewall        # open the media port (UAC prompt)
 
   ```
   GET  /status      GET  /devices      GET  /info
-  GET  /playback                           # what agent audio is audible now
+  GET  /profiles                           # bridge owner + profiles with the plugin
+  GET  /playback                           # audible audio + replies that were not spoken
   GET  /reply?token=<turn>                 # the reply a page turn produced
   POST /ask         {"text": "…"}          # -> {"token": "…", "submitted": true}
   POST /speak       {"text": "…"}          # speak without an agent turn
@@ -260,10 +269,21 @@ hermes googlehome firewall        # open the media port (UAC prompt)
   POST /destination {"session": "…", "mode": "off|speaker", "device": "…", "name": "…"}
   ```
 
+  `GET /profiles` reports the profile that hosts the bridge and the profiles
+  where this plugin is installed and enabled. The page uses it for the
+  bridge-owner notice; the composer uses it to stay out of profiles whose turns
+  have no speech hook.
+
+  `POST /profile` remains for CLI and older clients, but the page no longer
+  offers a profile picker: `gateway.profile_routes` is the authority.
+
   `GET /playback` is intentionally cheap: it reads an in-process registry and
   never touches the Cast socket, so the Desktop can poll it while a long reply
-  plays. `POST /stop` sends Cast `STOP` for the clip's `mediaSessionId` and
-  returns `{"ok": true, "stopped": 1, "playback": {"speaking": false, …}}`.
+  plays. It also carries `notices` — replies whose turn-end cast failed (each
+  with `seq`, `session`, `name`, and `error`), so the composer can name the
+  failure on a poll it was already making. `POST /stop` sends Cast `STOP` for the
+  clip's `mediaSessionId` and returns
+  `{"ok": true, "stopped": 1, "playback": {"speaking": false, …}}`.
 
   `POST /ask` and `POST /listen` return a **turn token**. The page polls
   `GET /reply?token=…` until `done`, then shows `reply` (or `error`: no speech
@@ -274,22 +294,42 @@ hermes googlehome firewall        # open the media port (UAC prompt)
 
 ### Which profile answers
 
-`/status` reports both `profile` (the plugin setting behind the page's selector)
-and `routed_profile` (what the gateway will actually use). When
-`gateway.profile_routes` names a profile for `googlehome`, that route wins inside
-`build_source`, and `profile_overridden` is true. The page then says
-`profile: <routed> · routed` and explains that the selector cannot change who
-answers — a choice it silently ignored was how a conversation looked lost.
+`/status` reports `routed_profile` (what the gateway will actually use),
+`profile` (the legacy plugin setting), and `bridge_profile` (the profile that
+hosts the adapter). When `gateway.profile_routes` names a profile for
+`googlehome`, that route wins inside `build_source`, and `profile_overridden` is
+true.
+
+The page does **not** offer a profile picker. The route is the authority, so the
+row is read-only: **Answered by** shows the routed profile, and an explanation
+appears when the plugin setting disagrees. That setting is now only a fallback
+for installs without a route; the adapter also derives its TTS credential scope
+from the routed profile, so a routed turn is not voiced with another profile's
+TTS provider. Change the route in Hermes config:
+
+```bash
+hermes config set gateway.profile_routes '[{"platform":"googlehome","profile":"coder"}]'
+hermes gateway restart
+```
 
 The session lives in the **routed** profile's store. The Desktop's sidebar scopes
 every section to the profile you are viewing, so to see the chat directly, switch
 to that profile (or **All agents**). The Google Home page lists it regardless of
 the sidebar's scope.
 
+The page remains visible from every profile because it is the bridge's remote
+control, not a profile-local feature. `/profiles` reports which profiles
+actually have the plugin enabled; the page uses it to say when the profile you
+are viewing cannot send its own chats to the speaker, and the composer uses it
+to stay out of those profiles.
+
 ### One conversation, one speaker
 
 The composer has a **Speaker** control for chats that are not the voice bridge:
-a normal Desktop conversation whose replies you want in the room.
+a normal Desktop conversation whose replies you want in the room. It only
+appears in a profile where the plugin is installed and enabled — turn-end
+speech is a profile-local `post_llm_call` hook, so a picker anywhere else would
+record a choice nothing reads.
 
 | Choice | Effect |
 |---|---|
@@ -304,6 +344,12 @@ Turn-end speech runs in the gateway and only for conversations that opted in,
 so it never doubles the platform adapter; a turn that already called
 `googlehome_speak` is not spoken again. The choice is stored under
 `$HERMES_HOME/googlehome/destinations.json` and expires after 12 hours.
+
+A reply that could not be cast is never silently dropped: the failure is recorded
+under `$HERMES_HOME/googlehome/notices.json`, the composer's usual `/playback`
+poll carries it, and the chat says **Couldn't speak the reply on \<speaker\>** with
+the backend's reason (a toast names it too). The text is still there — only the
+audio failed.
 
 While one of those replies is playing, the same stop control described above
 works from any conversation: the chip reads `⏹ stop`, and clicking it silences
@@ -465,7 +511,7 @@ of opening a second media server and Cast connection for the same speaker.
 | Key | Default | Meaning |
 |---|---|---|
 | `device` | `""` | speaker IP or friendly name; empty = first audio-only Cast device |
-| `profile` | `""` | profile that answers; empty = the gateway's own profile |
+| `profile` | `""` | legacy fallback when no `gateway.profile_routes` entry exists; a route always wins |
 | `volume` | `0` | speech volume 0–100; `0` leaves the device volume alone |
 | `max_chars` | `1400` | characters spoken per reply |
 | `cron_max_chars` | `400` | characters of a cron delivery that are spoken (80–2000) |
@@ -534,11 +580,11 @@ Two things worth knowing:
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -t .                    # 262 tests; adapter tests skip without core
+python -m unittest discover -s tests -t .                    # 276 tests; adapter tests skip without core
 $env:PYTHONPATH="$env:LOCALAPPDATA\hermes\hermes-agent"
 & "$env:LOCALAPPDATA\hermes\hermes-agent\.venv\Scripts\python.exe" `
   -m unittest tests.test_adapter_integration tests.test_reply_capture   # need Hermes core
-node tests/desktop/test_desktop_plugin.mjs                   # 27 loader/render/behaviour checks
+node tests/desktop/test_desktop_plugin.mjs                   # 36 loader/render/behaviour checks
 ```
 
 The Cast protocol is verified against `tests/mock_cast_device.py`, a TLS endpoint

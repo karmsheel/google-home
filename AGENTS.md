@@ -60,7 +60,7 @@ It never names a project, package, plug-in, module, or setting.
 |---|---|
 | `googlehome/__init__.py` | `register(ctx)`: platform, tools, CLI. Defers core imports. |
 | `googlehome/adapter.py` | The platform adapter: connect, cast, `send()`, voice turns, profile binding. |
-| `googlehome/control.py` | Loopback HTTP API (`/status`, `/reply`, `/playback`, `/devices`, `/ask`, `/speak`, `/stop`, `/listen`, `/device`, `/profile`, `/volume`, `/mute`, `/destination`). |
+| `googlehome/control.py` | Loopback HTTP API (`/status`, `/profiles`, `/reply`, `/playback`, `/devices`, `/ask`, `/speak`, `/stop`, `/listen`, `/device`, `/profile`, `/volume`, `/mute`, `/destination`). |
 | `googlehome/playback.py` | In-process registry of audible clips; the stop hooks and the `/playback` snapshot. |
 | `googlehome/ambient.py` | Per-conversation destinations chosen in the composer, and the turn-end hook that speaks them. |
 | `googlehome/tools.py` | The five tools the model can call. |
@@ -75,7 +75,7 @@ It never names a project, package, plug-in, module, or setting.
 | `googlehome/platform_entry.py` | `PlatformEntry` kwargs, feature-detected. |
 | `googlehome/desktop/plugin.js` | Hermes Desktop extension (single uncompiled file). |
 | `docs/REVERSE_ENGINEERING.md` | Protocol findings; why speaker-in is impossible. |
-| `tests/` | 270 stdlib tests (45 need Hermes core); `tests/desktop/` is the plugin.js harness. |
+| `tests/` | 294 stdlib tests (56 need Hermes core); `tests/desktop/` is the plugin.js harness. |
 
 ## How a turn becomes speech
 
@@ -118,31 +118,52 @@ Long task, "notify me on the living room speaker when done":
   clips are acknowledged and skipped, never cast twice.
 - **The adapter lives in the gateway process.** Tools and the control API reach
   it through `active_adapter()`; it is the only holder of the Cast session.
+- **The gateway route is the only profile authority.** `gateway.profile_routes`
+  decides who answers. The page reports `routed_profile` in a read-only
+  **Answered by** row; there is no profile picker that a route can override.
+  The adapter's TTS credential scope follows `effective_profile()` too, so a
+  routed turn is voiced with the same profile's provider. Transcription follows
+  it as well: `/listen` runs outside any turn, so `_transcribe_blocking` installs
+  the same scope around the STT provider.
 - **One speaker per conversation.** `chat_id` is stable so one device keeps one
   Hermes session.
 - **Registration does no network IO.** It runs in every process and Plugin
   Doctor blocks sockets during it.
 - **Missing prerequisites are UI states.** No ffmpeg, no TTS backend, or no
-  speaker is reported, never raised into the chat.
+  speaker is reported, never raised into the chat. A turn-end cast that failed is
+  recorded (`notices.json`) and reported by the composer's `/playback` poll as
+  **Couldn't speak the reply on …** plus a toast, because a silent speaker must
+  not look like a delivered reply.
 - **A conversation speaks only if it opted in.** `ambient.py` reads a
   per-session destination; no entry means silence. It skips the `googlehome`
   platform (the adapter already speaks those turns) and turns that already
   called `googlehome_speak` or `googlehome_notify`, so nothing is heard twice.
+  The clip is synthesized and cast on a worker thread, so the hook copies its
+  context into that thread: the gateway's per-profile scope (`HERMES_HOME`
+  override and secret mapping) is context-local, and without the copy Hermes TTS
+  fails closed on a multiplexed gateway and the room hears nothing.
 - **Cast is tolerated, not guaranteed.** Google supports the protocol
   begrudgingly; a cast takes over the speaker and adds latency.
 - **Audible output is interruptible.** Every cast path registers with
   `playback.py` between LOAD and the wait, so `/stop` can send the media STOP
   from outside the playback thread. `status()` must never take the speak lock
   while `speaking` — the Desktop's stop control depends on that poll returning.
+- **The page is a bridge control, not a profile feature.** The Desktop extension
+  is one global file and the page stays reachable from every profile because
+  stop, mute, volume, and push-to-talk belong to the room. It names its owner
+  (`bridge: <profile>`) when routing differs, and says when the viewed profile
+  has no plugin; it must never imply that the viewed profile owns the bridge.
+  `/profiles` is the authority for that notice and for the composer's
+  per-profile gate.
 - **The status-bar chip is a control, not a link.** It opens a popover (volume,
   mute, hide composer picker); the page carries the same three controls in a
-  **Speaker controls** box beside the boxed Speaker / Hermes profile rows (one
+  **Speaker controls** box beside the boxed Speaker / Answered by rows (one
   `SpeakerSection`, two columns via a container query at `@lg`), rendered by the
   one `SpeakerControls` component so the surfaces cannot drift. The two boxes
   stretch to a shared height (`flex-1` in a stretched grid item) and share the
   same surface (`bg-quinary` / `stroke-secondary`). The routing rows use
-  `ListRow wide` (picker on the title line) with their explanations in `Tip`s,
-  keeping the left box short. The page column
+  `ListRow wide` (the Speaker picker on the title line; the Answered-by chip is
+  read-only) with their explanations in `Tip`s, keeping the left box short. The page column
   is padded with `px-12`, marked `@container` so the section measures the column
   (not the window), and sized `min(calc(50% + 24rem), 88rem)` — half the side
   gutters of a 48rem column, capped for ultrawide panes. The page stays
@@ -177,12 +198,12 @@ Long task, "notify me on the living room speaker when done":
 ## Working on it
 
 ```powershell
-python -m unittest discover -s tests -t .        # 270 stdlib tests
+python -m unittest discover -s tests -t .        # 294 stdlib tests
 node tests/desktop/test_desktop_plugin.mjs       # plugin.js loader/render/behaviour harness
 hermes plugins doctor googlehome                 # manifest, import, register
 hermes googlehome check                          # speaker reachability
 hermes googlehome devices                        # mDNS scan
-hermes googlehome speak --text "hello"           # one sentence
+hermes googlehome speak "hello"                  # one sentence
 hermes googlehome notify --status done --task "the build"   # one-line outcome
 ```
 

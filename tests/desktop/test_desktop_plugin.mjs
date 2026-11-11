@@ -96,7 +96,7 @@ const modulePath = join(dir, 'plugin.mjs')
 // internals it drives so behaviour is exercised through the real code paths
 // rather than re-implemented here.
 const TEST_EXPORTS =
-  '\nexport { askText, $status, $reply, $replyError, $waiting, $conversations, $conversationIds, $composerHidden }\n'
+  '\nexport { askText, $status, $reply, $replyError, $waiting, $conversations, $conversationIds, $composerHidden, $profileInfo, $speakerNotice, refreshProfileInfo, refreshPlayback }\n'
 await writeFile(modulePath, rewritten + TEST_EXPORTS, 'utf8')
 const mod = await import(pathToFileURL(modulePath).href)
 const plugin = mod.default
@@ -398,6 +398,13 @@ async function until(predicate, timeoutMs = 8000) {
 // The page against a control API that answers a turn with a reply.
 let replyPolls = 0
 let failNextAsk = null
+let profilesResponse = {
+  ok: true,
+  bridge_profile: 'default',
+  plugin_profiles: ['default', 'coder']
+}
+// What the control API answers on the poll that also carries unspoken replies.
+let playbackResponse = { ok: true, speaking: false, notices: [] }
 const bridgeCalls = []
 globalThis.window = {
   hermesDesktop: {
@@ -425,6 +432,10 @@ globalThis.fetch = async (url, init) => {
       replyPolls < 2
         ? { ok: true, done: false, reply: '', error: '' }
         : { ok: true, done: true, reply: 'Hello from the speaker.', error: '' }
+  } else if (path.startsWith('/profiles')) {
+    body = profilesResponse
+  } else if (path.startsWith('/playback')) {
+    body = playbackResponse
   }
   return { ok: true, status: 200, json: async () => body }
 }
@@ -506,8 +517,8 @@ await acheck('routing and the speaker controls share a two-column section', () =
     'the Speaker setting should sit in the left column'
   )
   assert.ok(
-    findNode(grid, node => titleOf(node) === 'Hermes profile'),
-    'the Hermes profile setting should sit in the left column'
+    findNode(grid, node => titleOf(node) === 'Answered by'),
+    'the answered-by row should sit in the left column'
   )
   assert.ok(
     findNode(grid, node => node.props && node.props['aria-label'] === 'Mute the speaker'),
@@ -562,12 +573,13 @@ await acheck('a turn the gateway refuses is reported on the page', async () => {
   assert.match(mod.$replyError.get(), /did not accept/)
 })
 
-await acheck('the profile hint names the routed profile, not the selection', () => {
+await acheck('the profile row is a read-only report of the gateway route', () => {
   mod.$status.set({
     kind: 'ready',
     status: {
       profile: 'default',
       routed_profile: 'coder',
+      bridge_profile: 'default',
       profile_overridden: true,
       device: { reachable: true, name: 'Google Home Mini', address: '192.168.1.145' }
     }
@@ -575,11 +587,46 @@ await acheck('the profile hint names the routed profile, not the selection', () 
   const page = byArea('routes')[0].render()
   const text = strings(page).join('\n')
   assert.match(text, /profile: coder · routed/)
+  assert.match(text, /bridge: default/)
   // ListRow carries its copy in props; the SDK stub does not render it as text.
-  const profileRow = findNode(page, node => titleOf(node) === 'Hermes profile')
-  assert.ok(profileRow, 'the profile row should be rendered')
-  assert.match(profileRow.props.description, /Answers come from coder/)
-  assert.match(profileRow.props.description, /profile_routes/)
+  const profileRow = findNode(page, node => titleOf(node) === 'Answered by')
+  assert.ok(profileRow, 'the answered-by row should be rendered')
+  assert.match(profileRow.props.description, /Gateway profile_routes answers as coder/)
+  assert.match(profileRow.props.description, /plugin profile setting \(default\)/)
+  assert.equal(profileRow.props.action.props.children, 'coder')
+  assert.equal(profileRow.props.action.props.onValueChange, undefined)
+})
+
+await acheck('the page says when the viewed profile has no plugin', async () => {
+  profilesResponse = {
+    ok: true,
+    bridge_profile: 'default',
+    plugin_profiles: ['default']
+  }
+  await mod.refreshProfileInfo(true)
+  assert.deepEqual(mod.$profileInfo.get().plugin_profiles, ['default'])
+  const page = byArea('routes')[0].render()
+  const text = strings(page).join('\n')
+  assert.match(text, /does not have the Google Home plugin/)
+  assert.match(text, /bridge in default/)
+  assert.match(text, /install and enable the plugin here/)
+})
+
+await acheck('the composer picker stays out of profiles without the plugin', () => {
+  mod.$composerHidden.set(false)
+  mod.$profileInfo.set({
+    known: true,
+    bridge_profile: 'default',
+    plugin_profiles: ['default', 'designer']
+  })
+  const composer = byArea('composer.actions')[0]
+  assert.equal(composer.render().type({}), null, 'a profile without the plugin has no speech hook')
+  mod.$profileInfo.set({
+    known: true,
+    bridge_profile: 'default',
+    plugin_profiles: ['default', 'coder']
+  })
+  assert.notEqual(composer.render().type({}), null, 'a profile with the plugin keeps the picker')
 })
 
 await acheck('the popover mutes through the bridge', async () => {
@@ -614,6 +661,78 @@ await acheck('the volume slider commits through the bridge', async () => {
     await until(() => bridgeCalls.includes('/volume')),
     `volume never reached the bridge (${bridgeCalls.join(', ')})`
   )
+})
+
+await acheck('a reply that was not spoken is reported by the composer', async () => {
+  const seen = []
+  const original = sdkStub.host.notify
+  sdkStub.host.notify = notice => {
+    seen.push(notice)
+  }
+  try {
+    // The first poll adopts what the bridge already knew: opening a chat must not
+    // replay every old failure.
+    playbackResponse = {
+      ok: true,
+      speaking: false,
+      notices: [
+        { seq: 4, session: 'local-other', name: 'Kitchen speaker', at: Date.now() - 600000, error: 'old failure' }
+      ]
+    }
+    await mod.refreshPlayback()
+    assert.equal(seen.length, 0, 'history must not be announced')
+    assert.equal(mod.$speakerNotice.get(), '')
+
+    playbackResponse = {
+      ok: true,
+      speaking: false,
+      notices: [
+        { seq: 4, session: 'local-other', name: 'Kitchen speaker', at: Date.now() - 600000, error: 'old failure' },
+        {
+          seq: 5,
+          session: 'session-1',
+          name: 'Living Room speaker',
+          at: Date.now(),
+          error:
+            'No speech backend could speak. hermes: TTS chunk 1 failed (xai): quota. ' +
+            'Run `hermes gateway restart`; if it keeps happening, report it with `hermes debug share`.'
+        }
+      ]
+    }
+    await mod.refreshPlayback()
+    assert.match(mod.$speakerNotice.get(), /Couldn't speak the reply on Living Room speaker/)
+    assert.match(mod.$speakerNotice.get(), /TTS chunk 1 failed/)
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].kind, 'error')
+    assert.equal(seen[0].title, 'Reply not spoken')
+    assert.doesNotMatch(seen[0].message, /gateway restart/, 'restart advice is noise in a toast')
+
+    // The same notice must not be announced twice by the next poll.
+    await mod.refreshPlayback()
+    assert.equal(seen.length, 1)
+
+    // Another conversation's failure is a toast, not this composer's status line.
+    playbackResponse = {
+      ok: true,
+      speaking: false,
+      notices: [
+        { seq: 5, session: 'session-1', name: 'Living Room speaker', at: Date.now(), error: 'TTS chunk 1 failed' },
+        { seq: 6, session: 'local-other', name: 'Kitchen speaker', at: Date.now(), error: 'the cast was refused' }
+      ]
+    }
+    await mod.refreshPlayback()
+    assert.equal(seen.length, 2)
+    assert.match(seen[1].title, /Kitchen speaker/)
+    assert.match(seen[1].message, /cast was refused/)
+    assert.match(
+      mod.$speakerNotice.get(),
+      /Living Room speaker/,
+      'another conversation must not overwrite this status line'
+    )
+  } finally {
+    sdkStub.host.notify = original
+    playbackResponse = { ok: true, speaking: false, notices: [] }
+  }
 })
 
 await acheck('hiding the composer picker is remembered and empties the slot', () => {

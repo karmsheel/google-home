@@ -10,6 +10,7 @@ the Desktop extension (renderer) and the hook (gateway) are different processes.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import threading
@@ -132,17 +133,99 @@ def clear_destination(session_id: str) -> None:
 
 def _write(entries: Dict[str, Dict[str, Any]]) -> None:
     """Atomic replace: the hook may read while the renderer writes."""
-    target = _path()
-    temporary = target.with_suffix(f".{id(entries)}.tmp")
+    _replace_json(_path(), entries)
+
+
+def _replace_json(target: Path, payload: Any) -> None:
+    """Write JSON atomically, so a reader never sees a half-written file."""
+    temporary = target.with_suffix(f".{id(payload)}.tmp")
     try:
-        temporary.write_text(json.dumps(entries, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         temporary.replace(target)
     except OSError as exc:
-        logger.debug("[googlehome] could not store destinations: %s", exc)
+        logger.debug("[googlehome] could not store %s: %s", target.name, exc)
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# ── unspoken replies ─────────────────────────────────────────────────────────
+# A reply that never reached the room must not look delivered. The speaking
+# worker cannot raise into the turn (it is a daemon thread), and the Desktop is
+# a different process, so failures are recorded here and ride the control API's
+# ``/playback`` poll — the request the composer already makes to decide whether
+# the speaker is busy. Bounded and short-lived: this is a status line, not a log.
+NOTICE_TTL_MS = 15 * 60 * 1000
+MAX_NOTICES = 20
+
+_notices_lock = threading.Lock()
+
+
+def _notices_path() -> Path:
+    return ghconfig.state_dir() / "notices.json"
+
+
+def _notice_fresh(entry: Dict[str, Any], now: Optional[int] = None) -> bool:
+    try:
+        at = int(entry.get("at") or 0)
+    except (TypeError, ValueError):
+        return False
+    moment = int(time.time() * 1000) if now is None else now
+    return bool(at) and moment - at <= NOTICE_TTL_MS
+
+
+def _read_notices() -> Dict[str, Any]:
+    """The notice file as ``{"seq": int, "entries": [...]}``, never raising."""
+    try:
+        raw = _notices_path().read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, TypeError, ValueError):
+        return {"seq": 0, "entries": []}
+    if not isinstance(payload, dict):
+        return {"seq": 0, "entries": []}
+    entries = payload.get("entries")
+    try:
+        seq = int(payload.get("seq") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    return {
+        "seq": seq,
+        "entries": [entry for entry in entries if isinstance(entry, dict)]
+        if isinstance(entries, list) else [],
+    }
+
+
+def record_failure(session_id: Any, entry: Dict[str, Any], error: Any) -> None:
+    """Record that this conversation's reply never reached its speaker."""
+    key = str(session_id or "").strip()
+    message = str(error or "").strip()
+    if not key or not message:
+        return
+    now = int(time.time() * 1000)
+    with _notices_lock:
+        state = _read_notices()
+        entries = [item for item in state["entries"] if _notice_fresh(item, now)]
+        seq = int(state.get("seq") or 0) + 1
+        entries.append({
+            "seq": seq,
+            "session": key,
+            "device": str(entry.get("device") or "").strip(),
+            "name": str(entry.get("name") or "").strip(),
+            "at": now,
+            "error": message[:600],
+        })
+        if len(entries) > MAX_NOTICES:
+            entries = entries[-MAX_NOTICES:]
+        _replace_json(_notices_path(), {"seq": seq, "entries": entries})
+
+
+def notices() -> list[Dict[str, Any]]:
+    """Replies that were not spoken recently, oldest first (``seq`` ascending)."""
+    now = int(time.time() * 1000)
+    with _notices_lock:
+        state = _read_notices()
+    return [dict(item) for item in state["entries"] if _notice_fresh(item, now)]
 
 
 # ── turn marks ───────────────────────────────────────────────────────────────
@@ -178,7 +261,7 @@ def _already(session_id: Any, turn_id: Any) -> bool:
 
 
 # ── speaking ─────────────────────────────────────────────────────────────────
-def speak(text: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+def speak(text: str, entry: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
     """Synthesize and cast one reply to the conversation's speaker."""
     # Imported here: ``tools`` reaches the gateway adapter, and this module is
     # imported by registration in every process (and by the tests) without core.
@@ -188,18 +271,35 @@ def speak(text: str, entry: Dict[str, Any]) -> Dict[str, Any]:
     with _speak_lock:
         result = tools.speak_to(text, settings)
     if result.get("ok") is False:
-        logger.warning("[googlehome] %s", result.get("error") or "could not speak the reply")
+        message = result.get("error") or "could not speak the reply"
+        logger.warning("[googlehome] %s", message)
+        # The room stayed quiet, so the Desktop must say so: the text arrives,
+        # the speaker does not. Silent failures look like the bug this hooks.
+        record_failure(session_id, entry, message)
     return result
 
 
-def _speak_in_background(text: str, entry: Dict[str, Any]) -> None:
+def _speak_in_background(text: str, entry: Dict[str, Any], session_id: str = "") -> None:
     def run() -> None:
         try:
-            speak(text, entry)
+            speak(text, entry, session_id)
         except Exception as exc:  # noqa: BLE001 - a worker must not die loudly
             logger.debug("[googlehome] background speak failed: %s", exc)
 
-    threading.Thread(target=run, name="googlehome-speak", daemon=True).start()
+    # The turn runs inside the gateway's per-profile scope (a HERMES_HOME override
+    # and the profile's secret mapping, both contextvars). A new thread starts
+    # with an empty context, so TTS would read another profile's credentials — or,
+    # on a multiplexed gateway, fail closed with UnscopedSecretError ("Hermes could
+    # not read this profile's XAI_BASE_URL") and the reply would never be heard.
+    # Copy the hook's context into the worker, exactly as Hermes' own hook
+    # dispatcher does for the callback thread.
+    context = contextvars.copy_context()
+    threading.Thread(
+        target=context.run,
+        args=(run,),
+        name="googlehome-speak",
+        daemon=True,
+    ).start()
 
 
 # ── hooks ────────────────────────────────────────────────────────────────────
@@ -234,7 +334,7 @@ def on_post_llm_call(
         if _already(session_id, turn_id):
             return
         _mark(session_id, turn_id)
-        _speak_in_background(text, entry)
+        _speak_in_background(text, entry, str(session_id or ""))
     except Exception:  # noqa: BLE001 - a hook must never raise into the turn
         logger.debug("[googlehome] post_llm_call skipped", exc_info=True)
 

@@ -11,8 +11,9 @@ Endpoints
 ---------
 GET  /status     adapter + device state
 GET  /reply      ?token=...  the reply a Desktop turn produced (poll it)
-GET  /playback   what agent audio is playing right now (cheap; no Cast IO)
+GET  /playback   audible audio + replies that were not spoken (cheap; no Cast IO)
 GET  /devices    mDNS discovery results
+GET  /profiles   bridge owner + which profiles have this plugin enabled
 POST /ask        {"text": "..."}            run a turn as the bound profile
 POST /speak      {"text": "..."}            speak text, no agent turn
 POST /stop       {}                         stop whatever is playing
@@ -207,9 +208,17 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                 # Deliberately outside the asyncio/adaptor path: this is polled
                 # once a second by the Desktop while deciding whether to show
                 # the stop control, so it must never touch the Cast socket.
-                from . import playback
+                from . import ambient, playback
 
-                self._reply(200, {"ok": True, **playback.snapshot()})
+                # ``notices`` are replies that were not spoken (ambient speech on
+                # a conversation's own speaker fails in a daemon thread). They
+                # ride this poll so the composer can name the failure with no
+                # second request; reading a small file is still no Cast IO.
+                self._reply(200, {
+                    "ok": True,
+                    **playback.snapshot(),
+                    "notices": ambient.notices(),
+                })
                 return
             if path == "/reply":
                 # The speaker is the only output channel; this is how the page
@@ -231,6 +240,15 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                         for device in devices
                     ]
                     self._reply(200, {"ok": True, "devices": rows})
+                except Exception as exc:  # noqa: BLE001
+                    self._error(500, str(exc))
+                return
+            if path == "/profiles":
+                # The Desktop half is one global file, while the Python plugin
+                # loads per profile. This is how the page names the bridge's
+                # owner and the composer learns whether its profile has a hook.
+                try:
+                    self._reply(200, self.control.adapter.profile_availability())
                 except Exception as exc:  # noqa: BLE001
                     self._error(500, str(exc))
                 return

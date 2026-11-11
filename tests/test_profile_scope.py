@@ -123,6 +123,20 @@ class AdapterProfileScopeTests(unittest.TestCase):
         with GoogleHomeAdapter._profile_scope(self.host):
             get_secret("XAI_BASE_URL")
 
+    def test_profile_home_follows_the_route_not_the_old_selection(self):
+        """TTS credentials must use the profile that actually answers."""
+        from unittest import mock
+
+        from hermes_cli import profiles as profile_module
+
+        adapter = GoogleHomeAdapter.__new__(GoogleHomeAdapter)
+        adapter.settings = type("Settings", (), {"profile": "coder"})()
+        adapter.effective_profile = lambda: "researcher"
+        routed = Path(self.host.home) / "profiles" / "researcher"
+        with mock.patch.object(profile_module, "profile_exists", return_value=True), \
+             mock.patch.object(profile_module, "get_profile_dir", return_value=routed):
+            self.assertEqual(adapter._profile_home(), routed)
+
     def test_synthesize_runs_inside_the_scope(self):
         """`_synthesize` is what `send()` actually calls on a worker thread."""
         from unittest import mock
@@ -141,6 +155,28 @@ class AdapterProfileScopeTests(unittest.TestCase):
 
         self.assertEqual(paths, ["/tmp/fake.mp3"])
         self.assertEqual(seen["text"], "hello")
+
+    def test_transcription_runs_inside_the_scope(self):
+        """Push-to-talk transcribes outside any turn, so it needs the scope too.
+
+        `_transcribe_blocking` is what `/listen` calls on a worker thread; a
+        keyed STT provider would fail closed without this.
+        """
+        from unittest import mock
+
+        seen: dict = {}
+
+        def fake_transcribe(path):
+            seen["value"] = get_secret("XAI_BASE_URL")  # raises if unscoped
+            seen["path"] = path
+            return {"success": True, "transcript": "hello"}
+
+        with mock.patch("tools.voice_mode.transcribe_recording", side_effect=fake_transcribe):
+            result = GoogleHomeAdapter._transcribe_blocking(self.host, "/tmp/clip.webm")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(seen["path"], "/tmp/clip.webm")
+        self.assertTrue(seen["value"] is None or isinstance(seen["value"], str))
 
 
 if __name__ == "__main__":

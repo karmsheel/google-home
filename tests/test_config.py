@@ -147,6 +147,68 @@ class ConfigFileFallbackTests(unittest.TestCase):
         self.assertEqual(ghconfig.resolve_settings(None).device, "192.168.1.42")
 
 
+class PluginAvailabilityTests(unittest.TestCase):
+    """The Desktop is one global file; the Python half is per profile."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _home(self, name: str) -> Path:
+        return self.root if name == "default" else self.root / "profiles" / name
+
+    def _profile(self, name: str, enabled, *, installed: bool = True, disabled=None) -> Path:
+        home = self._home(name)
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(
+            "plugins:\n"
+            f"  enabled: {enabled!r}\n"
+            f"  disabled: {(disabled or [])!r}\n",
+            encoding="utf-8",
+        )
+        if installed:
+            (home / "plugins" / "googlehome").mkdir(parents=True, exist_ok=True)
+        return home
+
+    def test_only_installed_and_enabled_profiles_can_speak(self):
+        self._profile("default", ["googlehome"])
+        self._profile("coder", [])
+        self._profile("researcher", ["googlehome"])
+        info = ghconfig.plugin_availability(self.root, bridge_home=self.root)
+        self.assertEqual(info["bridge_profile"], "default")
+        self.assertEqual(info["plugin_profiles"], ["default", "researcher"])
+        self.assertEqual(
+            {row["name"]: (row["has_plugin"], row["plugin_enabled"]) for row in info["profiles"]},
+            {
+                "default": (True, True),
+                "coder": (True, False),
+                "researcher": (True, True),
+            },
+        )
+
+    def test_a_disabled_plugin_wins_over_enabled(self):
+        self._profile("default", ["googlehome"])
+        self._profile("coder", ["googlehome"], disabled=["googlehome"])
+        info = ghconfig.plugin_availability(self.root, bridge_home=self.root)
+        self.assertEqual(info["plugin_profiles"], ["default"])
+
+    def test_missing_code_is_not_available_even_when_enabled(self):
+        self._profile("default", ["googlehome"])
+        self._profile("coder", ["googlehome"], installed=False)
+        info = ghconfig.plugin_availability(self.root, bridge_home=self.root)
+        self.assertEqual(info["plugin_profiles"], ["default"])
+        coder = next(row for row in info["profiles"] if row["name"] == "coder")
+        self.assertFalse(coder["has_plugin"])
+        self.assertFalse(coder["plugin_enabled"])
+
+    def test_bridge_profile_is_named_from_its_home(self):
+        self._profile("default", ["googlehome"])
+        home = self._profile("researcher", ["googlehome"])
+        info = ghconfig.plugin_availability(self.root, bridge_home=home)
+        self.assertEqual(info["bridge_profile"], "researcher")
+
+
 class ChatIdTests(unittest.TestCase):
     def test_one_session_per_device(self):
         self.assertEqual(ghconfig.Settings(device="192.168.1.42").chat_id, "speaker-192.168.1.42")

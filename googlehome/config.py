@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -207,6 +208,119 @@ def hermes_home() -> Path:
     if raw:
         return Path(raw)
     return Path.home() / ".hermes"
+
+
+def profile_label(home: Optional[Path] = None) -> str:
+    """Display name of a Hermes home: ``default`` or the profile id."""
+    path = Path(home) if home is not None else hermes_home()
+    return path.name if path.parent.name.lower() == "profiles" else "default"
+
+
+_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _root_home() -> Path:
+    """The Hermes root that holds ``profiles/``.
+
+    In the supported single-host gateway the process home is the default profile
+    (the root); a ``-p`` CLI process has ``HERMES_HOME`` pointing at
+    ``profiles/<name>``. Both resolve to the same root here.
+    """
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    if raw:
+        home = Path(raw)
+        if home.parent.name.lower() == "profiles":
+            return home.parent.parent
+        return home
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root())
+    except Exception:  # noqa: BLE001 - stdlib tests do not import Hermes core
+        return Path.home() / ".hermes"
+
+
+def _profile_homes(root: Path) -> list[tuple[str, Path]]:
+    """``(name, home)`` for the default profile and every live named profile."""
+    homes: list[tuple[str, Path]] = [("default", Path(root))]
+    profiles_root = Path(root) / "profiles"
+    try:
+        children = sorted(profiles_root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return homes
+
+    try:
+        from hermes_constants import named_profile_is_live
+    except Exception:  # noqa: BLE001 - stdlib tests do not import Hermes core
+        named_profile_is_live = None  # type: ignore[assignment]
+
+    for child in children:
+        name = child.name
+        if name.startswith(".") or not _PROFILE_ID.match(name) or not child.is_dir():
+            continue
+        if named_profile_is_live is not None:
+            try:
+                if not named_profile_is_live(child):
+                    continue
+            except Exception:  # noqa: BLE001 - a broken profile must not hide the rest
+                continue
+        elif not any((child / marker).is_file() for marker in ("config.yaml", ".env", "profile.yaml")):
+            continue
+        homes.append((name, child))
+    return homes
+
+
+def _plugin_entry_names(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {str(item).strip().lower() for item in value if str(item).strip()}
+
+
+def _plugin_enabled(home: Path) -> bool:
+    """True when ``plugins.enabled`` names googlehome and ``plugins.disabled`` does not."""
+    path = Path(home) / "config.yaml"
+    try:
+        yaml = pysite.ensure_import("yaml")
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 - one broken profile must not 500 the page
+        return False
+    if not isinstance(data, dict):
+        return False
+    plugins = data.get("plugins")
+    if not isinstance(plugins, dict):
+        return False
+    if "googlehome" in _plugin_entry_names(plugins.get("disabled")):
+        return False
+    return bool({"googlehome", "platforms/googlehome"} & _plugin_entry_names(plugins.get("enabled")))
+
+
+def plugin_availability(
+    root: Optional[Path] = None, *, bridge_home: Optional[Path] = None
+) -> dict[str, Any]:
+    """Which live profiles have this plugin installed and enabled.
+
+    The Desktop extension is a single global file, but the Python half is
+    discovered per profile. The page needs to know which profile owns the
+    bridge, and the composer must not offer a speaker in a profile whose turns
+    have no ``post_llm_call`` hook to speak them.
+
+    A profile counts only when the plugin directory exists *and* its own
+    ``plugins.enabled`` allow-list names it. Installation without enablement is
+    still reported for diagnostics, but is not usable.
+    """
+    root_path = Path(root) if root is not None else _root_home()
+    rows: list[dict[str, Any]] = []
+    for name, home in _profile_homes(root_path):
+        plugin_dir = home / "plugins" / "googlehome"
+        installed = plugin_dir.is_dir() or plugin_dir.is_symlink()
+        enabled = installed and _plugin_enabled(home)
+        rows.append({"name": name, "has_plugin": installed, "plugin_enabled": enabled})
+    return {
+        "ok": True,
+        "bridge_profile": profile_label(bridge_home if bridge_home is not None else hermes_home()),
+        "plugin_profiles": [row["name"] for row in rows if row["plugin_enabled"]],
+        "profiles": rows,
+    }
 
 
 def state_dir() -> Path:

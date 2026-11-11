@@ -97,6 +97,18 @@ const $playback = atom({ speaking: false, kind: 'idle' })
 // speaking, it only gives the composer back.
 const $chipOpen = atom(false)
 const $composerHidden = atom(false)
+// The profile the Desktop is currently viewing. The Google Home page is a
+// bridge control visible everywhere, but the composer picker is a per-profile
+// capability: a profile without the plugin has no post_llm_call hook, so the
+// picker would record a destination nothing reads.
+const $activeProfile =
+  host.state && host.state.profile && typeof host.state.profile.get === 'function'
+    ? host.state.profile
+    : atom('')
+// Who owns the bridge and which profiles can actually speak. `known` stays
+// false against an older bridge that has no /profiles endpoint, in which case
+// the UI keeps its previous (always-visible) behaviour.
+const $profileInfo = atom({ known: false, bridge_profile: '', plugin_profiles: [] })
 
 let control = { info: null, at: 0 }
 let recorder = null
@@ -104,6 +116,7 @@ let chunks = []
 let noticeTimer = null
 let pollTimer = null
 let volumeTimer = null
+let profileInfoAt = 0
 // Plugin-scoped persistence, handed over by register(); a missing door keeps
 // the popover working for this run and simply forgets the picker preference.
 let pluginStorage = null
@@ -224,9 +237,99 @@ async function refreshStatus() {
   }
 }
 
+async function refreshProfileInfo(force) {
+  if (!force && $profileInfo.get().known && Date.now() - profileInfoAt < 15000) return
+  try {
+    const info = await bridgeApi('/profiles')
+    // An older bridge answers 404, and a hand-rolled one may omit the field:
+    // only a real list proves anything, so anything else stays "unknown" and
+    // the UI keeps its forgiving default rather than hiding a working control.
+    if (!info || !Array.isArray(info.plugin_profiles)) return
+    profileInfoAt = Date.now()
+    $profileInfo.set({
+      known: true,
+      bridge_profile: String(info.bridge_profile || '').trim(),
+      plugin_profiles: info.plugin_profiles.map(name => String(name || '').trim().toLowerCase()).filter(Boolean)
+    })
+  } catch {
+    /* old bridge or bridge down: keep the last known state */
+  }
+}
+
+// A reply the speaker never said must not look delivered. The gateway records
+// every failed ambient cast and serves those notices on the /playback poll this
+// page already makes, so the composer can name the failure without a second
+// request. `noticesSeq` is page-wide: the chip and the composer share one poll.
+const NOTICE_BACKLOG_MS = 2 * 60 * 1000
+let noticesSeq = null
+
+/** A backend error as one readable line, without the restart advice. */
+function failureSummary(error) {
+  let flat = String(error || '').replace(/\s+/g, ' ').trim()
+  flat = flat.replace(/^No speech backend could speak\.\s*/i, '')
+  flat = flat.replace(/\s*Run `?hermes gateway restart`[\s\S]*$/i, '').trim()
+  if (!flat) return 'speech synthesis failed'
+  return flat.length > 160 ? `${flat.slice(0, 159)}…` : flat
+}
+
+/** Is this session the chat the composer is looking at? */
+function isFocusedSession(session) {
+  const id = String(session || '')
+  if (!id) return false
+  try {
+    if (String(host.state.focusedSessionId.get() || '') === id) return true
+    const stored = host.state && host.state.focusedStoredSessionId
+    return Boolean(stored && typeof stored.get === 'function' && String(stored.get() || '') === id)
+  } catch {
+    return false
+  }
+}
+
+function showUnspoken(notice) {
+  const where = withoutAddress(notice.name || notice.device || '') || 'the speaker'
+  const reason = failureSummary(notice.error)
+  const mine = isFocusedSession(notice.session)
+  if (mine) $speakerNotice.set(`Couldn't speak the reply on ${where}: ${reason}`)
+  host.notify({
+    kind: 'error',
+    title: mine ? 'Reply not spoken' : `Reply not spoken on ${where}`,
+    message: `${where}: ${reason}`,
+    icon: 'broadcast',
+    durationMs: 10000
+  })
+}
+
+/**
+ * Announce each unspoken reply once. The first poll adopts the bridge's history
+ * (except a failure from the last couple of minutes for this very chat, which is
+ * still news), so opening a conversation does not replay old ones.
+ */
+function announceUnspoken(snapshot) {
+  const notices = Array.isArray(snapshot && snapshot.notices) ? snapshot.notices : []
+  if (!notices.length) {
+    if (noticesSeq === null) noticesSeq = 0
+    return
+  }
+  const newest = notices.reduce((top, item) => Math.max(top, Number(item.seq) || 0), 0)
+  if (noticesSeq === null) {
+    noticesSeq = newest
+    for (const notice of notices) {
+      if (isFocusedSession(notice.session) && Date.now() - Number(notice.at || 0) <= NOTICE_BACKLOG_MS) {
+        showUnspoken(notice)
+      }
+    }
+    return
+  }
+  const fresh = notices.filter(item => (Number(item.seq) || 0) > noticesSeq)
+  noticesSeq = Math.max(noticesSeq, newest)
+  for (const notice of fresh) showUnspoken(notice)
+}
+
 async function refreshPlayback() {
   try {
-    $playback.set({ ...(await bridgeApi('/playback')), kind: 'ready' })
+    const snapshot = await bridgeApi('/playback')
+    $playback.set({ ...snapshot, kind: 'ready' })
+    announceUnspoken(snapshot)
   } catch {
     // An unreachable bridge is already reported by refreshStatus; do not turn
     // a missed poll into a stop button for audio that may not be playing.
@@ -637,7 +740,7 @@ function Chip({ children }) {
 function TalkButton() {
   const recording = useValue($recording)
   const busy = useValue($busy)
-  const label = recording ? 'Stop and send' : 'Hold a conversation'
+  const label = recording ? 'Stop and send' : 'Start Conversation'
 
   return jsx(Button, {
     variant: recording ? 'destructive' : 'default',
@@ -699,6 +802,13 @@ function StatusHeader() {
                 }`
               })
             : null,
+          // The page is reachable from every profile; when routing sends turns
+          // somewhere other than the profile hosting the adapter, say where the
+          // bridge itself lives. This is not a selector, so it is a chip.
+          status.bridge_profile &&
+          status.bridge_profile !== (status.routed_profile || status.profile)
+            ? jsx(Chip, { children: `bridge: ${status.bridge_profile}` })
+            : null,
           typeof status.device?.volume === 'number'
             ? jsx(Chip, { children: `volume ${Math.round(status.device.volume * 100)}%` })
             : null,
@@ -718,7 +828,6 @@ function StatusHeader() {
 function ConnectionRow() {
   const statusState = useValue($status)
   const devices = useValue($devices)
-  const profiles = useValue($profiles)
   const status = (statusState && statusState.status) || {}
   const device = status.device || {}
 
@@ -733,26 +842,7 @@ function ConnectionRow() {
     }
   }
 
-  const bindProfile = async value => {
-    hapticTap()
-    try {
-      const result = await bridgeApi('/profile', { method: 'POST', body: { profile: value } })
-      const next = (result && result.status) || {}
-      // Selecting a profile the gateway's routes override would be a silent lie:
-      // say who really answers instead of claiming the choice took effect.
-      if (next.profile_overridden) {
-        say(`Gateway routing sends this platform to ${next.routed_profile} — that profile answers.`)
-      } else {
-        say('Profile updated')
-      }
-      await refreshStatus()
-    } catch (error) {
-      say(errorText(error, 'Could not change the profile'))
-    }
-  }
-
   const deviceValue = device.address || device.host || ''
-  const profileValue = status.routed_profile || status.profile || ''
   const routedProfile = String(status.routed_profile || '')
   const configuredProfile = String(status.profile || '')
   const profileOverridden = Boolean(status.profile_overridden) || Boolean(routedProfile && routedProfile !== configuredProfile)
@@ -766,7 +856,7 @@ function ConnectionRow() {
       jsx(ListRow, {
         wide: true,
         title: jsx(Tip, {
-          label: 'The device that will voice this profile.',
+          label: 'The speaker the bridge controls. Every profile talks through this one device.',
           children: jsx('span', { children: 'Speaker' })
         }),
         action: jsxs(Select, {
@@ -794,28 +884,39 @@ function ConnectionRow() {
       jsx(ListRow, {
         wide: true,
         title: jsx(Tip, {
-          label: 'Who answers when you talk to the speaker.',
-          children: jsx('span', { children: 'Hermes profile' })
+          label: "Set by the gateway's profile_routes. This page reports it; it cannot change it.",
+          children: jsx('span', { children: 'Answered by' })
         }),
-        // Only the override warning earns a visible line: it says the Select
-        // cannot do what it looks like it does.
+        // The route is the only authority. The old picker wrote a plugin setting
+        // that profile_routes overrode, and that setting still scopes the TTS
+        // credentials — a control that changes something other than its label.
+        // It is a read-only chip now; the route belongs in Hermes config.
         description: profileOverridden
-          ? `Answers come from ${routedProfile || 'the gateway default'} — the gateway's profile_routes sends this platform there, so this selector cannot change it.`
+          ? `Gateway profile_routes answers as ${routedProfile || 'the gateway default'}; the plugin profile setting (${configuredProfile || 'unset'}) cannot override it.`
           : '',
-        action: jsxs(Select, {
-          value: profileValue,
-          onValueChange: value => void bindProfile(value),
-          children: [
-            jsx(SelectTrigger, { className: 'w-56', children: jsx(SelectValue, { placeholder: 'Gateway default' }) }),
-            jsx(SelectContent, {
-              children: profiles.map(name =>
-                jsx(SelectItem, { value: name, children: name }, name)
-              )
-            })
-          ]
+        action: jsx(Chip, {
+          children: routedProfile || configuredProfile || 'gateway default'
         })
       })
     ]
+  })
+}
+
+/**
+ * The page is a bridge control, visible from every profile. That is useful
+ * (stop/mute/push-to-talk belong to the room, not to the selected profile), but
+ * it must not imply that the profile you are viewing owns the speaker.
+ */
+function PluginNotice() {
+  const info = useValue($profileInfo)
+  const active = useValue($activeProfile)
+  if (!info.known || !active) return null
+  const current = String(active).trim().toLowerCase()
+  if (!current || info.plugin_profiles.includes(current)) return null
+  const bridge = info.bridge_profile || 'the gateway profile'
+  return jsx('p', {
+    className: 'text-xs text-(--ui-text-tertiary)',
+    children: `This profile (${active}) does not have the Google Home plugin. This page is controlling the bridge in ${bridge}; install and enable the plugin here for this profile's chats to use the speaker.`
   })
 }
 
@@ -1053,6 +1154,7 @@ function BridgePage() {
 
   useEffect(() => {
     void refreshStatus()
+    void refreshProfileInfo()
     void loadDevices()
     void loadProfiles()
     pollTimer = setInterval(() => {
@@ -1088,6 +1190,7 @@ function BridgePage() {
       style: { maxWidth: 'min(calc(50% + 24rem), 88rem)' },
       children: [
         jsx(StatusHeader, {}),
+        jsx(PluginNotice, {}),
         jsxs('div', {
           className: 'flex items-center gap-2',
           children: [
@@ -1115,6 +1218,7 @@ function SettingsPage() {
 
   useEffect(() => {
     void refreshStatus()
+    void refreshProfileInfo()
     void loadDevices()
     void loadProfiles()
   }, [])
@@ -1125,6 +1229,7 @@ function SettingsPage() {
     className: 'flex flex-col gap-3',
     children: [
       jsx(StatusHeader, {}),
+      jsx(PluginNotice, {}),
       jsx(ConnectionRow, {}),
       jsxs('div', {
         className: 'flex flex-col gap-1 text-xs text-(--ui-text-tertiary)',
@@ -1460,6 +1565,8 @@ function ComposerSpeaker() {
   const devices = useValue($speakerDevices)
   const notice = useValue($speakerNotice)
   const hidden = useValue($composerHidden)
+  const profileInfo = useValue($profileInfo)
+  const activeProfile = useValue($activeProfile)
   const [storedId, setStoredId] = useState('')
   // The picker is also the closest thing to a transport control: while audio is
   // audible (including a cron delivery this conversation never chose), show the
@@ -1535,10 +1642,22 @@ function ComposerSpeaker() {
     }
   }, [session])
 
+  useEffect(() => {
+    void refreshProfileInfo()
+  }, [])
+
   // Hidden from the chip's popover: the conversation keeps whichever speaker it
   // already chose, the composer just stops spending a control on it. The
   // popover is the way back, so this can never strand the choice.
-  if (hidden) return null
+  //
+  // Also absent where the profile has no plugin: this picker writes a
+  // destination, and the turn-end hook that reads it is registered by the
+  // plugin in *this* profile. Showing it elsewhere would be a no-op control.
+  // An older bridge has no /profiles answer, so `known` stays false and the
+  // picker keeps its previous forgiving behaviour.
+  const profileName = String(activeProfile || '').trim().toLowerCase()
+  const speaksHere = !profileInfo.known || !profileName || profileInfo.plugin_profiles.includes(profileName)
+  if (hidden || !speaksHere) return null
 
   const Icon = SDK_ICONS && (on || pendingValue || speaking ? SDK_ICONS.Volume2 : SDK_ICONS.VolumeX)
 

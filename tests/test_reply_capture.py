@@ -345,6 +345,14 @@ class _LoopAdapter:
         self.seen["muted"] = muted
         return {"ok": True, "muted": muted}
 
+    def profile_availability(self) -> dict:
+        return {
+            "ok": True,
+            "bridge_profile": "default",
+            "plugin_profiles": ["default", "coder"],
+            "profiles": [],
+        }
+
     def close(self) -> None:
         self._loop.call_soon_threadsafe(self._loop.stop)
 
@@ -390,6 +398,12 @@ class ControlReplyEndpointTests(unittest.TestCase):
         replied = self._get("/reply")
         self.assertTrue(replied["ok"])
         self.assertEqual(self.adapter.seen["token"], "")
+
+    def test_profiles_endpoint_names_the_bridge_and_plugin_profiles(self):
+        info = self._get("/profiles")
+        self.assertTrue(info["ok"])
+        self.assertEqual(info["bridge_profile"], "default")
+        self.assertEqual(info["plugin_profiles"], ["default", "coder"])
 
 
 class ControlMuteEndpointTests(unittest.TestCase):

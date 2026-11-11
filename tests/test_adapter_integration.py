@@ -532,6 +532,7 @@ class AdapterOutboundTests(unittest.TestCase):
 
         self.assertEqual(status["device"]["label"], "google home mini (127.0.0.1)")
         self.assertEqual(status["device"]["model"], "google home mini")
+        self.assertEqual(status["bridge_profile"], "default")
 
     def test_unreachable_speaker_keeps_platform_up(self):
         with mock.patch.multiple(
