@@ -1,5 +1,9 @@
 # Hermes ⇄ Google Home
 
+<p align="center">
+  <img src="assets/googlehome.jpg" alt="Hermes Google Home: a Cast speaker paired with a Hermes profile" width="100%">
+</p>
+
 A Hermes Agent plugin (plus a Hermes Desktop extension) that puts a **Google Home
 Mini** — or any Cast-only Google Home / Nest speaker — on the other end of a
 Hermes profile's conversation: you talk, a profile answers, the speaker says it
