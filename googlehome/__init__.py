@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 PLUGIN_NAME = "googlehome"
 PLATFORM_NAME = "googlehome"
 __all__ = ["register", "PLUGIN_NAME", "PLATFORM_NAME", "__version__"]
@@ -22,6 +22,7 @@ __all__ = ["register", "PLUGIN_NAME", "PLATFORM_NAME", "__version__"]
 def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
     from .adapter import GoogleHomeAdapter, check_requirements, validate_config
+    from . import ambient
     from .cli import run_action, setup_cli
     from .config import remember_ctx
     from .platform_entry import build_platform_kwargs
@@ -39,6 +40,10 @@ def register(ctx: Any) -> None:
         validate_config=validate_config,
     ))
     register_tools(ctx)
+
+    # Per-conversation destinations chosen from the Desktop composer: a normal
+    # chat speaks only when it was pointed at a speaker there.
+    ambient.register_hooks(ctx)
     ctx.register_cli_command(
         name="googlehome",
         help="Google Home speaker bridge: check, devices, speak, status, firewall",

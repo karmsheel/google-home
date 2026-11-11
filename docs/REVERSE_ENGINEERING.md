@@ -206,6 +206,20 @@ produces no frames after `PLAYING`, so waiting on frames stalls. Poll instead:
 ← MEDIA_STATUS          {status:[{playerState:"IDLE","idleReason":"FINISHED"}]}
 ```
 
+To interrupt instead of waiting, send `STOP` on the media namespace using the
+`mediaSessionId` the `LOAD` reply reported:
+
+```
+→ media / <transport>   {"type":"STOP","mediaSessionId":N,"requestId":M}
+← MEDIA_STATUS          {status:[{playerState:"IDLE","idleReason":"CANCELLED"}]}
+```
+
+The session id is the only handle the receiver accepts, so the client keeps it
+from `LOAD` until the clip ends. `STOP` is fire-and-forget from another thread:
+awaiting a reply there would steal the `MEDIA_STATUS` the playback loop is
+already polling for. With no session id, the receiver-namespace `STOP` stops the
+launched application as a fallback.
+
 Latency from `LOAD` to first audio is roughly **1–3 s** (receiver launch is the
 dominant term on the first cast after idle). Budget it in the voice loop.
 

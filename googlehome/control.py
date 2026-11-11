@@ -10,9 +10,11 @@ find both the port and the token).
 Endpoints
 ---------
 GET  /status     adapter + device state
+GET  /playback   what agent audio is playing right now (cheap; no Cast IO)
 GET  /devices    mDNS discovery results
 POST /ask        {"text": "..."}            run a turn as the bound profile
 POST /speak      {"text": "..."}            speak text, no agent turn
+POST /stop       {}                         stop whatever is playing
 POST /listen     {"data_url": "data:audio/...;base64,..."}  transcribe + turn
 POST /device     {"device": "ip or name"}   re-target the speaker
 POST /profile    {"profile": "name"}        re-bind the profile
@@ -178,14 +180,36 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                 except Exception as exc:  # noqa: BLE001
                     self._error(500, str(exc))
                 return
+            if path == "/playback":
+                # Deliberately outside the asyncio/adaptor path: this is polled
+                # once a second by the Desktop while deciding whether to show
+                # the stop control, so it must never touch the Cast socket.
+                from . import playback
+
+                self._reply(200, {"ok": True, **playback.snapshot()})
+                return
             if path == "/devices":
                 try:
                     from . import discovery
 
                     devices = discovery.discover(timeout=3.0)
-                    self._reply(200, {"ok": True, "devices": devices})
+                    rows = [
+                        {**device, "label": discovery.display_label(device)}
+                        for device in devices
+                    ]
+                    self._reply(200, {"ok": True, "devices": rows})
                 except Exception as exc:  # noqa: BLE001
                     self._error(500, str(exc))
+                return
+            if path == "/destination":
+                # The composer asks where *this conversation's* replies go.
+                from urllib.parse import parse_qs
+
+                from . import ambient
+
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                session = (parse_qs(query).get("session") or [""])[0]
+                self._reply(200, {"ok": True, "destination": ambient.destination_for(session)})
                 return
             if path == "/info":
                 self._reply(200, {"ok": True, **self.control.adapter.control_info()})
@@ -203,6 +227,22 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                 return
             adapter = self.control.adapter
             try:
+                if path == "/stop":
+                    # The stop hooks only send Cast frames; they do not wait for
+                    # the adapter's asyncio loop, so a busy or stopping turn
+                    # cannot make the button unresponsive.
+                    from . import playback
+
+                    result = playback.stop()
+                    result["playback"] = playback.snapshot()
+                    if result.get("stopped"):
+                        logger.info("[googlehome] stopped %s playback(s)", result["stopped"])
+                    if not result.get("ok"):
+                        result["error"] = "; ".join(result.get("errors") or []) or (
+                            "could not stop the speaker"
+                        )
+                    self._reply(200 if result.get("ok") else 500, result)
+                    return
                 if path == "/ask":
                     text = str(body.get("text") or "").strip()
                     if not text:
@@ -240,6 +280,25 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                     spec = str(body.get("device") or "")
                     result = self.control.run(adapter.set_device(spec))
                     self._reply(200, {"ok": True, "status": result})
+                    return
+                if path == "/destination":
+                    from . import ambient
+
+                    session = str(body.get("session") or "").strip()
+                    if not session:
+                        self._error(400, "session is required")
+                        return
+                    try:
+                        entry = ambient.set_destination(
+                            session,
+                            str(body.get("mode") or ""),
+                            device=str(body.get("device") or ""),
+                            name=str(body.get("name") or ""),
+                        )
+                    except ValueError as exc:
+                        self._error(400, str(exc))
+                        return
+                    self._reply(200, {"ok": True, "destination": entry})
                     return
                 if path == "/profile":
                     name = str(body.get("profile") or "")

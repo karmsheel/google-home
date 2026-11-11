@@ -288,6 +288,37 @@ def describe(device: dict[str, Any]) -> str:
     return f"{name} ({model})".strip() if model else name
 
 
+def display_name(device: dict[str, Any]) -> str:
+    """What the speaker *is*: its model, else its friendly name, else its address.
+
+    The friendly name is whatever the owner typed in the Google Home app
+    ("Living Room speaker"), which is not the same thing as the hardware. A
+    bound device that was resolved from a bare IP has neither until
+    ``identify()`` fills them in; it reports its address until then.
+    """
+    device = normalize(device or {})
+    model = str(device.get("model") or "").strip()
+    if model:
+        return model
+    name = str(device.get("name") or "").strip()
+    address = str(device.get("address") or device.get("host") or "").strip()
+    if name and name != address:
+        return name
+    return address or "Cast device"
+
+
+def display_label(device: dict[str, Any]) -> str:
+    """``display_name`` with the address in brackets: "Google Home Mini (10.0.0.42)".
+
+    The address is omitted when it would just repeat the name, so an
+    unidentified device reads as "10.0.0.42", not "10.0.0.42 (10.0.0.42)".
+    """
+    device = normalize(device or {})
+    name = display_name(device)
+    address = str(device.get("address") or device.get("host") or "").strip()
+    return f"{name} ({address})" if address and address not in name else name
+
+
 # ── device identity ──────────────────────────────────────────────────────────
 def eureka_info(host: str, timeout: float = 3.0) -> dict[str, Any]:
     """Read the unauthenticated setup API (port 8443) for model/firmware identity."""
@@ -307,24 +338,75 @@ def eureka_info(host: str, timeout: float = 3.0) -> dict[str, Any]:
         return {}
 
 
-def resolve_device(spec: str, *, timeout: float = 3.0) -> dict[str, Any]:
+def identify(host: str, timeout: float = 2.0) -> dict[str, str]:
+    """Ask the speaker itself what it is: ``{name, model}``, best effort.
+
+    mDNS TXT carries the same two fields (``fn``/``md``), but only for a device
+    that answered a multicast query. This unicast lookup also works when the
+    speaker is pinned by IP or the network drops multicast, which are exactly
+    the cases where a bound device would otherwise be named by its address.
+    """
+    info = eureka_info(host, timeout=timeout)
+    if not info:
+        return {}
+    device_info = info.get("device_info") or {}
+    identity = {
+        "name": str(info.get("name") or "").strip(),
+        "model": str(device_info.get("model_name") or "").strip(),
+    }
+    return {key: value for key, value in identity.items() if value}
+
+
+def _enriched(device: dict[str, Any], enabled: bool) -> dict[str, Any]:
+    """Fill in the identity of a device the discovery answer did not describe."""
+    if not enabled or not device or device.get("model"):
+        return device
+    host = str(device.get("address") or device.get("host") or "").strip()
+    if not host:
+        return device
+    identity = identify(host)
+    if not identity:
+        return device
+    enriched = dict(device)
+    enriched["name"] = identity.get("name") or enriched.get("name", "")
+    enriched["model"] = identity.get("model") or enriched.get("model", "")
+    return enriched
+
+
+def resolve_device(
+    spec: str,
+    *,
+    timeout: float = 3.0,
+    enrich: bool = False,
+) -> dict[str, Any]:
     """Resolve a config string to ``{host, port, name, model, address}``.
 
     ``spec`` may be empty (pick the first audio-only Cast device), an IP, a
     hostname, or a friendly name matched against the mDNS ``fn`` field.
+
+    ``enrich`` asks the device's setup API for its model/friendly name when the
+    fast path (an IP literal dialled without discovery) did not learn them.
+    That is one extra ~100 ms request, so callers that only need a dial target
+    leave it off.
     """
     spec = (spec or "").strip()
     if spec:
         try:
             ipaddress.ip_address(spec)
-            return {"host": spec, "port": CAST_PORT, "name": spec, "model": "", "address": spec}
+            return _enriched(
+                {"host": spec, "port": CAST_PORT, "name": spec, "model": "", "address": spec},
+                enrich,
+            )
         except ValueError:
             pass
 
     devices = [normalize(device) for device in discover(timeout=timeout)]
     if not devices:
         if spec:
-            return {"host": spec, "port": CAST_PORT, "name": spec, "model": "", "address": spec}
+            return _enriched(
+                {"host": spec, "port": CAST_PORT, "name": spec, "model": "", "address": spec},
+                enrich,
+            )
         return {}
 
     if spec:
@@ -334,10 +416,10 @@ def resolve_device(spec: str, *, timeout: float = 3.0) -> dict[str, Any]:
                 str(device.get(field, "")) for field in ("name", "model", "host", "address")
             ).lower()
             if lowered in haystack:
-                return device
+                return _enriched(device, enrich)
         logger.warning("no Cast device matched %r; using %s", spec, describe(devices[0]))
     audio_only = [d for d in devices if d.get("audio_only")]
-    return (audio_only or devices)[0]
+    return _enriched((audio_only or devices)[0], enrich)
 
 
 def dial_host(device: dict[str, Any]) -> str:

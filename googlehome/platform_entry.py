@@ -39,6 +39,8 @@ def _supported_fields() -> set[str]:
 def build_platform_kwargs(*, ctx: Any, adapter: Any, check_fn: Any, validate_config: Any) -> dict[str, Any]:
     """Assemble the kwargs for ``ctx.register_platform``."""
     from . import PLATFORM_NAME
+    from .standalone import send_standalone
+    from .standalone import send_standalone
 
     kwargs: dict[str, Any] = {
         "name": PLATFORM_NAME,
@@ -63,6 +65,16 @@ def build_platform_kwargs(*, ctx: Any, adapter: Any, check_fn: Any, validate_con
         ),
         "docs_url": "https://github.com/NousResearch/hermes-agent",
         "pii_safe": True,
+        # Cron reads this env var when a job's ``deliver`` names this platform
+        # without a chat id. The helper writes explicit targets instead (one
+        # gateway-wide adapter serves every profile), but declaring the field
+        # keeps ``googlehome`` a valid delivery platform for bare tokens and
+        # for the cron target pickers.
+        "cron_deliver_env_var": "GOOGLEHOME_HOME_CHANNEL",
+        # Cron output also arrives from short-lived processes (`hermes cron run`,
+        # restart-safe workers) where no live adapter exists. This sender asks
+        # the running bridge to speak, falling back to an inline cast.
+        "standalone_sender_fn": send_standalone,
     }
     supported = _supported_fields()
     for key, value in optional.items():

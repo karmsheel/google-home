@@ -130,6 +130,72 @@ class ResolveDeviceTests(unittest.TestCase):
         self.assertEqual(resolved["host"], "speaker.lan")
 
 
+class IdentifyTests(unittest.TestCase):
+    """A device pinned by IP still has to say what hardware it is."""
+
+    EUREKA = {
+        "name": "Living Room speaker",
+        "device_info": {"model_name": "Google Home Mini", "product_name": "mushroom"},
+    }
+
+    def test_identity_comes_from_the_device_info_block(self):
+        with mock.patch.object(discovery, "eureka_info", return_value=self.EUREKA):
+            self.assertEqual(
+                discovery.identify("192.168.1.145"),
+                {"name": "Living Room speaker", "model": "Google Home Mini"},
+            )
+
+    def test_identity_is_empty_when_the_device_does_not_answer(self):
+        with mock.patch.object(discovery, "eureka_info", return_value={}):
+            self.assertEqual(discovery.identify("192.168.1.145"), {})
+
+    def test_ip_spec_is_enriched_without_waiting_for_multicast(self):
+        with mock.patch.object(discovery, "eureka_info", return_value=self.EUREKA), \
+                mock.patch.object(discovery, "discover") as mocked_discover:
+            resolved = discovery.resolve_device("192.168.1.145", enrich=True)
+
+        mocked_discover.assert_not_called()
+        self.assertEqual(resolved["host"], "192.168.1.145")
+        self.assertEqual(resolved["address"], "192.168.1.145", "the dial address must not move")
+        self.assertEqual(resolved["name"], "Living Room speaker")
+        self.assertEqual(resolved["model"], "Google Home Mini")
+
+    def test_a_device_mdns_already_described_is_not_probed_again(self):
+        devices = [_device("10.0.0.60", "bedroom", model="Google Home Mini")]
+        with mock.patch.object(discovery, "discover", return_value=devices), \
+                mock.patch.object(discovery, "eureka_info") as mocked_eureka:
+            resolved = discovery.resolve_device("", enrich=True)
+
+        mocked_eureka.assert_not_called()
+        self.assertEqual(resolved["model"], "Google Home Mini")
+
+    def test_an_unreachable_device_keeps_the_configured_address(self):
+        with mock.patch.object(discovery, "eureka_info", return_value={}), \
+                mock.patch.object(discovery, "discover"):
+            resolved = discovery.resolve_device("192.168.1.200", enrich=True)
+
+        self.assertEqual(resolved["host"], "192.168.1.200")
+        self.assertEqual(resolved["name"], "192.168.1.200")
+
+
+class DisplayTests(unittest.TestCase):
+    def test_model_names_the_speaker_and_the_address_goes_in_brackets(self):
+        device = discovery.normalize(
+            _device("192.168.1.145", "Living Room speaker", model="Google Home Mini")
+        )
+        self.assertEqual(discovery.display_name(device), "Google Home Mini")
+        self.assertEqual(discovery.display_label(device), "Google Home Mini (192.168.1.145)")
+
+    def test_friendly_name_stands_in_when_the_model_is_unknown(self):
+        device = discovery.normalize(_device("10.0.0.50", "kitchen", model=""))
+        self.assertEqual(discovery.display_name(device), "kitchen")
+        self.assertEqual(discovery.display_label(device), "kitchen (10.0.0.50)")
+
+    def test_an_unnamed_device_uses_its_address_once(self):
+        device = discovery.normalize({"name": "10.0.0.50", "address": "10.0.0.50"})
+        self.assertEqual(discovery.display_label(device), "10.0.0.50")
+
+
 class DialHostTests(unittest.TestCase):
     """The SRV target is ``<uuid>.local``; Windows cannot resolve that name."""
 

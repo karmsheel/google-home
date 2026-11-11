@@ -33,7 +33,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 from . import PLATFORM_NAME, __version__
 from . import config as ghconfig
-from . import castdevice, discovery, speech
+from . import castdevice, discovery, playback, speech
 from .audioserver import MediaServer, content_type_for
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,16 @@ class GoogleHomeAdapter(BasePlatformAdapter):
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._loop = asyncio.get_running_loop()
+        if self.settings.proxy:
+            # A second multiplex profile bound to the same speaker. Do not open
+            # another media server, control server or Cast connection: forward
+            # every utterance to the primary bridge's loopback API instead.
+            self._started = True
+            self.started_at = time.time()
+            self._ensure_home_channel()
+            self._mark_connected()
+            logger.info("[%s] proxy mode: forwarding speech to the primary bridge", PLATFORM_NAME)
+            return True
         try:
             self._media.start()
         except OSError as exc:
@@ -144,6 +154,7 @@ class GoogleHomeAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         register_instance(self)
+        self._ensure_home_channel()
         logger.info(
             "[%s] ready: device=%s profile=%s media_port=%s",
             PLATFORM_NAME,
@@ -153,9 +164,44 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         )
         return True
 
+    def _ensure_home_channel(self) -> None:
+        """Persist a home channel so bare ``deliver: googlehome`` resolves.
+
+        Cron's bare-platform token resolves to the platform's home channel. The
+        bridge has exactly one conversation, so this is the chat id the adapter
+        already uses; setting it once is what makes the obvious cron target
+        work without hand-written ``googlehome:speaker-...`` tokens.
+        """
+        try:
+            from gateway.config import (
+                HomeChannel, Platform, load_gateway_config, persist_home_channel,
+            )
+
+            platform = Platform(PLATFORM_NAME)
+            existing = load_gateway_config().get_home_channel(platform)
+            if existing is not None and existing.chat_id:
+                return
+            chat_id = self.settings.chat_id
+            if self.settings.proxy:
+                from .cronlink import live_chat_id
+
+                chat_id = live_chat_id() or chat_id
+            persist_home_channel(HomeChannel(
+                platform=platform,
+                chat_id=chat_id,
+                name=str(self._device.get("name") or "Google Home"),
+            ))
+            logger.info("[%s] home channel set to %s", PLATFORM_NAME, chat_id)
+        except Exception as exc:  # noqa: BLE001 - a home channel is best effort
+            logger.debug("[%s] could not set a home channel: %s", PLATFORM_NAME, exc)
+
     async def disconnect(self) -> None:
         self._started = False
         unregister_instance(self)
+        # Do not leave a reply talking to an empty room after the bridge is
+        # gone; the stop hook sends one last STOP before the socket closes.
+        playback.stop()
+        playback.reset()
         if self._control is not None:
             try:
                 self._control.stop()
@@ -175,7 +221,7 @@ class GoogleHomeAdapter(BasePlatformAdapter):
     # ── device ───────────────────────────────────────────────────────────────
     def _resolve_blocking(self) -> dict[str, Any]:
         try:
-            resolved = discovery.resolve_device(self.settings.device, timeout=3.0)
+            resolved = discovery.resolve_device(self.settings.device, timeout=3.0, enrich=True)
         except Exception as exc:  # noqa: BLE001 - discovery is best effort
             self.last_error = f"device discovery failed: {exc}"
             return {}
@@ -270,6 +316,13 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             filename = self._media.publish(path)
             queued.append((self._media.url_for(filename, host), content_type_for(path)))
 
+        interrupted = threading.Event()
+        device_name = str(self._device.get("name") or self._device.get("host") or "")
+
+        def request_stop() -> bool:
+            interrupted.set()
+            return client.stop_current()
+
         volume_before: Optional[float] = None
         if self.settings.volume:
             try:
@@ -280,13 +333,22 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         try:
             max_wait = self._max_wait_for(paths)
             for url, mime in queued:
-                result = client.play_and_wait(
+                if interrupted.is_set():
+                    break
+                started = client.play_url(
                     url,
                     content_type=mime,
                     title="Hermes",
                     timeout=15.0,
-                    max_wait=max_wait,
                 )
+                handle = playback.begin(request_stop, source="reply", device=device_name)
+                try:
+                    result = client.wait_until_done(started, max_wait=max_wait)
+                finally:
+                    playback.end(handle)
+                if interrupted.is_set():
+                    logger.info("[%s] playback stopped on request", PLATFORM_NAME)
+                    break
                 if not result.get("finished"):
                     logger.warning("[%s] playback did not report an idle state for %s",
                                    PLATFORM_NAME, url)
@@ -383,8 +445,12 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             )
 
     # ── outbound ─────────────────────────────────────────────────────────────
-    def _spoken_text(self, content: str) -> str:
+    def _spoken_text(self, content: str, *, cron: bool = False) -> str:
         text = content or ""
+        if cron:
+            # A cron delivery is a wrapped report. Speak the job name plus a
+            # short digest (or its explicit SPEAK: line), never the scaffolding.
+            return speech.cron_digest(text, self.settings.cron_max_chars).strip()
         prepare = getattr(self, "prepare_tts_text", None)
         if callable(prepare):
             try:
@@ -402,11 +468,19 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
-        if not self.settings.speak_replies:
+        # Cron passes ``job_id`` in the metadata; interactive replies do not.
+        is_cron = bool((metadata or {}).get("job_id"))
+        if is_cron:
+            if not self.settings.speak_cron:
+                return SendResult(success=True, message_id=f"gh-cron-muted-{uuid.uuid4().hex[:8]}")
+        elif not self.settings.speak_replies:
             return SendResult(success=True, message_id=f"gh-muted-{uuid.uuid4().hex[:8]}")
-        text = self._spoken_text(content)
+
+        text = self._spoken_text(content, cron=is_cron)
         if not text:
             return SendResult(success=True, message_id=f"gh-empty-{uuid.uuid4().hex[:8]}")
+        if self.settings.proxy:
+            return await self._proxy_send(text)
 
         try:
             files = await asyncio.to_thread(self._synthesize, text)
@@ -429,6 +503,21 @@ class GoogleHomeAdapter(BasePlatformAdapter):
 
         self.last_error = ""
         return SendResult(success=True, message_id=f"gh-{uuid.uuid4().hex[:10]}")
+
+    async def _proxy_send(self, text: str) -> SendResult:
+        """Speak through the primary bridge's loopback API."""
+        from .standalone import _speak_via_bridge
+
+        result = await asyncio.to_thread(_speak_via_bridge, text)
+        if result is None:
+            self.last_error = "the primary bridge is not running"
+            return SendResult(success=False, error=self.last_error, retryable=True)
+        if result.get("error"):
+            self.last_error = str(result["error"])
+            return SendResult(success=False, error=self.last_error, retryable=True)
+        self.last_error = ""
+        self.last_spoken = text
+        return SendResult(success=True, message_id=f"gh-proxy-{uuid.uuid4().hex[:8]}")
 
     async def play_tts(self, chat_id: str, audio_path: str, **kwargs: Any) -> SendResult:
         """Hermes already synthesized audio for this turn: just play it."""
@@ -542,6 +631,7 @@ class GoogleHomeAdapter(BasePlatformAdapter):
 
     # ── status / control helpers ─────────────────────────────────────────────
     async def status(self) -> dict[str, Any]:
+        playing = playback.snapshot()
         payload: dict[str, Any] = {
             "ok": True,
             "platform": PLATFORM_NAME,
@@ -549,12 +639,21 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             "started": self._started,
             "uptime_seconds": round(time.time() - self.started_at, 1) if self.started_at else 0,
             "connected": self._started,
-            "speaking": self.speaking,
+            # ``speaking`` covers the instant between LOAD and the registry
+            # entry; ``playback`` covers agent speech cast outside this adapter
+            # (a conversation pointed at its own speaker).
+            "speaking": bool(self.speaking or playing["speaking"]),
+            "playback": playing,
             "profile": self.settings.profile or "",
             "chat_id": self.settings.chat_id,
             "device": {
                 "name": self._device.get("name", ""),
                 "model": self._device.get("model", ""),
+                "label": (
+                    discovery.display_label(self._device)
+                    if self._device.get("host") or self._device.get("address")
+                    else ""
+                ),
                 "address": self._device.get("address") or self._device.get("host", ""),
                 "host": self._device.get("host", ""),
                 "port": self._device.get("port", 8009),
@@ -567,7 +666,10 @@ class GoogleHomeAdapter(BasePlatformAdapter):
                 "profile": self.settings.profile,
                 "volume": self.settings.volume,
                 "speak_replies": self.settings.speak_replies,
+                "speak_cron": self.settings.speak_cron,
+                "proxy": self.settings.proxy,
                 "max_chars": self.settings.max_chars,
+                "cron_max_chars": self.settings.cron_max_chars,
                 "control_port": self.settings.control_port,
                 "speech_backend": self.settings.speech_backend,
             },
@@ -581,7 +683,11 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             "last_spoken": self.last_spoken[-400:],
             "last_transcript": self.last_transcript[-400:],
         }
-        if self._device.get("host"):
+        # Reading the live volume takes ``_speak_lock``, which the playback
+        # thread holds for the whole clip. Doing it while speaking would make
+        # every status poll wait for the speech to end — exactly the window in
+        # which the Desktop needs to see "speaking" and offer its stop control.
+        if self._device.get("host") and not payload["speaking"]:
             try:
                 payload["device"]["volume"] = await asyncio.to_thread(self._live_volume)
             except castdevice.CastError:

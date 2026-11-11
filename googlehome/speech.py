@@ -47,9 +47,30 @@ _TABLE_RULE = re.compile(r"^\s*\|?[\s:|-]{6,}\|?\s*$", re.MULTILINE)
 _EXTRA_SPACE = re.compile(r"[ \t]{2,}")
 _EXTRA_NEWLINES = re.compile(r"\n{3,}")
 
+#: Cron wraps delivered output as
+#:   Cronjob Response: <name>
+#:   (job_id: <id>)
+#:   -------------
+#:
+#:   <body>
+#:
+#:   To stop or manage this job, send me a new message (e.g. "stop reminder <name>").
+#: None of that scaffolding belongs in the room.
+_CRON_HEADER = re.compile(
+    r"\ACronjob Response:[ \t]*(?P<name>[^\n]*)\n\(job_id:[^\n]*\)\n-{3,}[ \t]*\n",
+    re.IGNORECASE,
+)
+_CRON_FOOTER = re.compile(r"\n+To stop or manage this job,[^\n]*(?:\n|\Z)", re.IGNORECASE)
+#: A job can say exactly what it wants heard with a line like ``SPEAK: the build is green``.
+_CRON_SPEAK_LINE = re.compile(
+    r"^[ \t]*(?:SPEAK|VOICE|SAY)[ \t]*:[ \t]*(?P<text>.+?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 BACKENDS = ("hermes", "sapi", "edge")
 DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
 EDGE_CHUNK_CHARS = 1800
+DEFAULT_CRON_MAX_CHARS = 400
 
 #: Backend that last worked in this process; tried first next time.
 _preferred: str = ""
@@ -66,8 +87,14 @@ def last_backend() -> str:
 
 
 # ── text ─────────────────────────────────────────────────────────────────────
-def flatten_for_speech(text: str, max_chars: int = 1400) -> str:
-    """Strip markdown so the model's formatting does not get read out loud."""
+def flatten_for_speech(
+    text: str, max_chars: int = 1400, *, tail: str = "…and more in the Hermes window."
+) -> str:
+    """Strip markdown so the model's formatting does not get read out loud.
+
+    ``tail`` is appended when the text has to be cut; pass ``""`` for a clean
+    ellipsis-free cut (the cron digest uses a chat-flavoured phrase instead).
+    """
     if not text:
         return ""
     out = _CODE_FENCE.sub(" Code omitted. ", text)
@@ -90,8 +117,52 @@ def flatten_for_speech(text: str, max_chars: int = 1400) -> str:
     for separator in (". ", "! ", "? ", "\n"):
         cut = clipped.rfind(separator)
         if cut > max_chars * 0.5:
-            return clipped[:cut + 1].strip() + " …and more in the Hermes window."
-    return clipped.rstrip() + " …and more in the Hermes window."
+            return clipped[:cut + 1].strip() + (f" {tail}" if tail else "")
+    return clipped.rstrip() + (f" {tail}" if tail else "")
+
+
+def strip_cron_wrapper(text: str) -> tuple[str, str]:
+    """Split cron's delivery scaffolding from the job output.
+
+    Returns ``(body, job_name)``. Jobs created with ``cron.wrap_response:
+    false`` have no header, so the name comes back empty and the text is
+    returned untouched.
+    """
+    raw = text or ""
+    name = ""
+    body = raw
+    header = _CRON_HEADER.match(raw)
+    if header:
+        name = header.group("name").strip()
+        body = raw[header.end():]
+    body = _CRON_FOOTER.sub("", body)
+    return body.strip(), name
+
+
+def cron_digest(text: str, max_chars: int = DEFAULT_CRON_MAX_CHARS) -> str:
+    """The part of a cron delivery that is worth saying out loud.
+
+    Prefers an explicit ``SPEAK:`` line, else the opening of the report. The
+    marker lets a job control the spoken sentence exactly while still sending
+    the full markdown to the text channel.
+    """
+    body, name = strip_cron_wrapper(text)
+    if not body:
+        return ""
+
+    markers = [m.group("text").strip() for m in _CRON_SPEAK_LINE.finditer(body)]
+    if markers:
+        spoken = flatten_for_speech(" ".join(markers), max_chars, tail="…")
+    else:
+        spoken = flatten_for_speech(body, max_chars, tail="…and more in the chat.")
+    if not spoken:
+        return ""
+
+    if name:
+        prefix = flatten_for_speech(name, 80, tail="")
+        if prefix:
+            spoken = f"{prefix}. {spoken}"
+    return spoken
 
 
 def split_for_tts(text: str, limit: int) -> list[str]:

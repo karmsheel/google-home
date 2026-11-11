@@ -29,6 +29,8 @@ ENV_PREFIX = "GOOGLEHOME_"
 
 #: fallback spoken-reply length before chunking
 DEFAULT_MAX_CHARS = 1400
+#: a cron delivery is a notification, not a podcast: speak a digest, not the report
+DEFAULT_CRON_MAX_CHARS = 400
 DEFAULT_CONTROL_PORT = 8765
 
 _PLUGIN_CTX: Optional[Any] = None
@@ -82,11 +84,16 @@ class Settings:
     speech_backend: str = "auto"
     speech_voice: str = ""
     max_chars: int = DEFAULT_MAX_CHARS
+    cron_max_chars: int = DEFAULT_CRON_MAX_CHARS
     control_port: int = DEFAULT_CONTROL_PORT
     media_port: int = 0
     token_required: bool = True
     speak_replies: bool = True
+    speak_cron: bool = True
     restore_volume: bool = True
+    # Secondary multiplex profile: forward speech to the primary bridge instead
+    # of opening a second Cast connection and media server for the same speaker.
+    proxy: bool = False
     extra: dict = field(default_factory=dict)
 
     @property
@@ -164,6 +171,8 @@ def resolve_settings(config: Any = None) -> Settings:
     volume = max(0, min(100, _as_int(pick("volume", 0), 0)))
     max_chars = max(120, min(8000, _as_int(pick("max_chars", DEFAULT_MAX_CHARS),
                                             DEFAULT_MAX_CHARS)))
+    cron_max_chars = max(80, min(2000, _as_int(pick("cron_max_chars", DEFAULT_CRON_MAX_CHARS),
+                                               DEFAULT_CRON_MAX_CHARS)))
     control_port = _as_int(pick("control_port", DEFAULT_CONTROL_PORT), DEFAULT_CONTROL_PORT)
     media_port = _as_int(pick("media_port", 0), 0)
 
@@ -175,11 +184,14 @@ def resolve_settings(config: Any = None) -> Settings:
         speech_backend=(str(pick("speech_backend", "auto") or "auto").strip().lower() or "auto"),
         speech_voice=str(pick("speech_voice", "") or "").strip(),
         max_chars=max_chars,
+        cron_max_chars=cron_max_chars,
         control_port=control_port,
         media_port=media_port,
         token_required=_as_bool(pick("token_required"), True),
         speak_replies=_as_bool(pick("speak_replies"), True),
+        speak_cron=_as_bool(pick("speak_cron"), True),
         restore_volume=_as_bool(pick("restore_volume"), True),
+        proxy=_as_bool(pick("proxy"), False),
         extra=extra,
     )
 

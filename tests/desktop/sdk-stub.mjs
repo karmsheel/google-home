@@ -30,11 +30,14 @@ export const ROUTES_AREA = 'routes'
 export const SIDEBAR_NAV_AREA = 'sidebar.nav'
 export const PALETTE_AREA = 'palette'
 export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' }
+export const COMPOSER_AREAS = { actions: 'composer.actions' }
 
 export const host = {
   state: {
     profile: makeAtom('coder'),
-    gateway: makeAtom('open')
+    gateway: makeAtom('open'),
+    focusedSessionId: makeAtom('session-1'),
+    focusedStoredSessionId: makeAtom('session-1')
   },
   navigate() {},
   notify() {},
@@ -60,3 +63,7 @@ export const SelectItem = component('SelectItem')
 export const SelectTrigger = component('SelectTrigger')
 export const SelectValue = component('SelectValue')
 export const Tip = component('Tip')
+export const icons = {
+  Volume2: component('Volume2'),
+  VolumeX: component('VolumeX')
+}

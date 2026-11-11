@@ -222,6 +222,55 @@ class FlattenTests(unittest.TestCase):
         self.assertEqual(speech.flatten_for_speech(None), "")
 
 
+class CronDigestTests(unittest.TestCase):
+    WRAPPER = (
+        "Cronjob Response: Daily Digest\n"
+        "(job_id: abc123)\n"
+        "-------------\n\n"
+        "{body}\n\n"
+        "To stop or manage this job, send me a new message "
+        "(e.g. \"stop reminder Daily Digest\")."
+    )
+
+    def test_wrapper_is_stripped_and_name_is_kept(self):
+        text = self.WRAPPER.format(body="The build is green.")
+        spoken = speech.cron_digest(text)
+        self.assertEqual(spoken, "Daily Digest. The build is green.")
+
+    def test_footer_and_job_id_are_never_spoken(self):
+        spoken = speech.cron_digest(self.WRAPPER.format(body="All systems nominal."))
+        for fragment in ("Cronjob Response", "job_id", "To stop or manage", "abc123"):
+            self.assertNotIn(fragment, spoken)
+
+    def test_missing_wrapper_still_works(self):
+        self.assertEqual(speech.cron_digest("Plain output."), "Plain output.")
+
+    def test_long_output_is_capped_with_a_chat_tail(self):
+        body = "This is a sentence about the daily result. " * 40
+        spoken = speech.cron_digest(self.WRAPPER.format(body=body), max_chars=200)
+        self.assertLessEqual(len(spoken), 260)
+        self.assertIn("more in the chat", spoken)
+
+    def test_speak_marker_wins(self):
+        text = self.WRAPPER.format(
+            body="Full report with lots of detail.\n\nSPEAK: The digest is ready, two new items."
+        )
+        spoken = speech.cron_digest(text)
+        self.assertIn("The digest is ready", spoken)
+        self.assertNotIn("Full report", spoken)
+
+    def test_speak_marker_is_flattened(self):
+        text = self.WRAPPER.format(body="SPEAK: **Build** _green_ for [main](https://x.test).")
+        spoken = speech.cron_digest(text)
+        self.assertEqual(spoken, "Daily Digest. Build green for main.")
+
+    def test_empty_body(self):
+        self.assertEqual(
+            speech.cron_digest("Cronjob Response: X\n(job_id: 1)\n-------------\n\n"),
+            "",
+        )
+
+
 class SapiAvailabilityTests(unittest.TestCase):
     def test_availability_follows_the_platform(self):
         self.assertEqual(speech.sapi_available(), sys.platform == "win32")

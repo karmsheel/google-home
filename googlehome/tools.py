@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any, Optional
 
-from . import castdevice, discovery, speech
+from . import castdevice, discovery, playback, speech
 from . import config as ghconfig
 from .adapter import active_adapter
 from .audioserver import MediaServer, content_type_for
@@ -26,11 +27,16 @@ def _settings() -> ghconfig.Settings:
     return ghconfig.resolve_settings(None)
 
 
-def _direct_play(files: list[str], settings: ghconfig.Settings) -> dict[str, Any]:
+def _direct_play(
+    files: list[str],
+    settings: ghconfig.Settings,
+    *,
+    source: str = "speaker",
+) -> dict[str, Any]:
     """Speak without a running adapter: one connection, one temp media server."""
     if not files:
         return {"ok": False, "error": "nothing to speak"}
-    resolved = discovery.resolve_device(settings.device, timeout=3.0)
+    resolved = discovery.resolve_device(settings.device, timeout=3.0, enrich=True)
     host = discovery.dial_host(resolved)
     if not host:
         return {
@@ -47,6 +53,13 @@ def _direct_play(files: list[str], settings: ghconfig.Settings) -> dict[str, Any
     try:
         media.start()
         client.connect()
+        interrupted = threading.Event()
+        device_name = str(resolved.get("name") or host)
+
+        def request_stop() -> bool:
+            interrupted.set()
+            return client.stop_current()
+
         volume_before: Optional[float] = None
         if settings.volume:
             try:
@@ -56,13 +69,24 @@ def _direct_play(files: list[str], settings: ghconfig.Settings) -> dict[str, Any
                 volume_before = None
         try:
             for path in files:
+                if interrupted.is_set():
+                    break
                 filename = media.publish(path)
-                client.play_and_wait(
+                started = client.play_url(
                     media.url_for(filename, local_ip),
                     content_type=content_type_for(path),
                     timeout=15.0,
-                    max_wait=max(20.0, min(600.0, _size(path) / 8000.0)),
                 )
+                handle = playback.begin(request_stop, source=source, device=device_name)
+                try:
+                    client.wait_until_done(
+                        started,
+                        max_wait=max(20.0, min(600.0, _size(path) / 8000.0)),
+                    )
+                finally:
+                    playback.end(handle)
+                if interrupted.is_set():
+                    break
         finally:
             if volume_before is not None and settings.restore_volume:
                 try:
@@ -111,9 +135,32 @@ def _speak(text: str, *, settings: Optional[ghconfig.Settings] = None) -> dict[s
             return {"ok": True, "device": adapter._device.get("name", ""), "via": "gateway"}
         except castdevice.CastError as exc:
             return {"ok": False, "error": str(exc), "via": "gateway"}
-    result = _direct_play(files, settings)
+    result = _direct_play(files, settings, source="tool")
     result["via"] = "direct"
     return result
+
+
+def speak_to(text: str, settings: ghconfig.Settings) -> dict[str, Any]:
+    """Synthesize and cast to ``settings.device``, bypassing the adapter.
+
+    Used when a conversation picked its own speaker in the composer: that
+    device may be one the adapter is not bound to.
+    """
+    spoken = speech.flatten_for_speech(text, settings.max_chars)
+    if not spoken:
+        return {"ok": True, "skipped": True}
+    try:
+        files = speech.synthesize(
+            spoken,
+            provider=settings.tts_provider,
+            backend=settings.speech_backend,
+            voice=settings.speech_voice,
+        )
+    except speech.TtsUnavailable as exc:
+        return {"ok": False, "error": str(exc), "kind": "tts_unavailable"}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc), "kind": "tts_failed"}
+    return _direct_play(files, settings, source="ambient")
 
 
 def _status(settings: ghconfig.Settings) -> dict[str, Any]:
@@ -125,11 +172,12 @@ def _status(settings: ghconfig.Settings) -> dict[str, Any]:
             "profile": adapter.settings.profile or "(gateway default)",
             "device": adapter._device,
             "volume": adapter._device.get("volume"),
-            "speaking": adapter.speaking,
+            "speaking": bool(adapter.speaking or playback.is_speaking()),
+            "playback": playback.snapshot(),
             "last_error": adapter.last_error,
             "media": adapter._media.stats,
         }
-    resolved = discovery.resolve_device(settings.device, timeout=3.0)
+    resolved = discovery.resolve_device(settings.device, timeout=3.0, enrich=True)
     host = discovery.dial_host(resolved)
     if not host:
         return {"ok": False, "via": "direct", "error": "no Cast device discovered",
@@ -164,7 +212,7 @@ def _handle_volume(args: dict[str, Any], **_kwargs: Any) -> str:
             adapter._apply_volume(level)
             adapter.settings.volume = level
             return json.dumps({"ok": True, "volume": level, "via": "gateway"})
-        resolved = discovery.resolve_device(settings.device, timeout=3.0)
+        resolved = discovery.resolve_device(settings.device, timeout=3.0, enrich=True)
         host = discovery.dial_host(resolved)
         if not host:
             return json.dumps({"ok": False, "error": "no Cast device discovered"})

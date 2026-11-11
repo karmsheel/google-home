@@ -1,7 +1,7 @@
 name: googlehome
 label: Google Home
 kind: platform
-version: 0.1.0
+version: 0.2.0
 author: karmsheel
 description: >
   Put a Google Home Mini (or any Google Home / Nest Cast speaker) on the other
@@ -19,7 +19,9 @@ provides_tools:
   - googlehome_status
   - googlehome_volume
   - googlehome_devices
-provides_hooks: []
+provides_hooks:
+  - post_llm_call
+  - post_tool_call
 config_schema:
   device:
     type: str
@@ -81,3 +83,26 @@ config_schema:
     default: true
     label: Speak replies
     description: Cast every agent reply to the speaker.
+  speak_cron:
+    type: bool
+    default: true
+    label: Speak cron job output
+    description: >
+      Speak cron deliveries addressed to this platform. Only a short digest is
+      spoken; the full output still goes to the job's other delivery targets.
+  cron_max_chars:
+    type: int
+    default: 400
+    label: Spoken cron limit
+    description: >
+      Characters of a cron delivery that are spoken (80-2000). Keep this short:
+      a notification should not tie up the speaker for minutes.
+  proxy:
+    type: bool
+    default: false
+    label: Forward to primary bridge
+    description: >
+      Secondary-profile mode: do not open another media server or Cast
+      connection for this profile, forward speech to the primary bridge
+      instead. Only for a multiplex gateway that already runs the speaker
+      adapter in another profile.

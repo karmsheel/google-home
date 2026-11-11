@@ -93,6 +93,26 @@ class CastClientTests(unittest.TestCase):
         self.assertTrue(result["finished"])
         self.assertEqual(result["idle_reason"], "FINISHED")
 
+    def test_stop_current_cuts_a_long_clip_short(self):
+        device = MockCastDevice(finish_after=None).start()
+        self.addCleanup(device.stop)
+        client = CastClient("127.0.0.1", device.port, timeout=5.0)
+        self.addCleanup(client.close)
+        client.connect()
+
+        started = client.play_url("http://x/long.mp3", timeout=5.0)
+        self.assertEqual(device.current_state, "PLAYING")
+        self.assertIsNotNone(client.media_session_id, "LOAD must remember its media session")
+        self.assertTrue(client.stop_current())
+
+        result = client.wait_until_done(started, max_wait=10.0)
+        self.assertTrue(result["finished"])
+        self.assertEqual(device.current_state, "IDLE")
+
+    def test_stop_current_without_a_loaded_clip_is_a_no_op(self):
+        self.client.connect()
+        self.assertFalse(self.client.stop_current())
+
     def test_probe_helper(self):
         info = probe("127.0.0.1", self.device.port, timeout=5.0)
         self.assertEqual(info["host"], "127.0.0.1")

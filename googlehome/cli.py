@@ -7,6 +7,7 @@ could actually make the device talk.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import subprocess
@@ -15,7 +16,7 @@ from typing import Any
 
 from . import castdevice, discovery
 from . import config as ghconfig
-from . import speech
+from . import cronlink, speech
 from .audioserver import MediaServer, content_type_for
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,28 @@ def setup_cli(parser: Any) -> None:
 
     actions.add_parser("status", help="read the running bridge through its control API")
 
+    cron = actions.add_parser(
+        "cron",
+        help="add the speaker to cron job output (on, off, or status)",
+    )
+    cron.add_argument(
+        "state", nargs="?", choices=("on", "off", "status", "test"), default="status",
+        help="attach the speaker to every job, detach it, show the wiring, or speak a test",
+    )
+    cron.add_argument(
+        "--chat-id", default="",
+        help="override the speaker chat id used in deliver targets",
+    )
+    cron.add_argument(
+        "--cron-profile", default="",
+        help="profile whose cron jobs to change (default: the current profile)",
+    )
+    cron.add_argument(
+        "--dry-run", action="store_true",
+        help="show what would change without writing jobs.json",
+    )
+    cron.add_argument("--json", action="store_true", help="machine-readable output")
+
     firewall = actions.add_parser("firewall", help="open the media port (prompts for UAC)")
     firewall.add_argument("--port", type=int, default=0, help="override the media port")
 
@@ -64,11 +87,12 @@ def run_action(args: Any) -> int:
         "devices": _devices,
         "speak": _speak_action,
         "status": _status,
+        "cron": _cron,
         "firewall": _firewall,
     }
     handler = handlers.get(action)
     if handler is None:
-        print(f"unknown action {action!r}; try: check, devices, speak, status, firewall")
+        print(f"unknown action {action!r}; try: check, devices, speak, status, cron, firewall")
         return 2
     return int(handler(args) or 0)
 
@@ -95,7 +119,7 @@ def _check(args: Any) -> int:
     print(f"\n1. mDNS discovery: {len(devices)} Cast device(s)")
     _print_devices(devices)
 
-    resolved = discovery.resolve_device(settings.device, timeout=3.0)
+    resolved = discovery.resolve_device(settings.device, timeout=3.0, enrich=True)
     host = discovery.dial_host(resolved)
     report: dict[str, Any] = {
         "configured_device": settings.device,
@@ -270,6 +294,191 @@ def _read_control() -> dict[str, Any]:
         return json.loads((ghconfig.state_dir() / "control.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+# ── cron wiring ──────────────────────────────────────────────────────────────
+def _cron(args: Any) -> int:
+    """``hermes googlehome cron [on|off|status]`` — speaker as a cron target."""
+    settings = _settings()
+    chat_id = cronlink.resolve_chat_id(settings.chat_id, getattr(args, "chat_id", ""))
+    state = getattr(args, "state", None) or "status"
+    as_json = bool(getattr(args, "json", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    try:
+        home = _cron_profile_home(getattr(args, "cron_profile", ""))
+        label = cronlink.profile_label(home)
+        if state == "status":
+            return _cron_status(chat_id, settings, as_json, home=home, label=label)
+        if state == "test":
+            return _cron_test(chat_id, as_json)
+        return _cron_toggle(state, chat_id, settings, as_json, dry_run=dry_run,
+                            home=home, label=label)
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+    except ImportError:
+        print(
+            "Hermes cron is not available in this environment. Run this through the\n"
+            "`hermes` command so the cron store and profile are on the path."
+        )
+        return 1
+    except Exception as exc:  # noqa: BLE001 - a CLI failure should be readable
+        logger.debug("cron wiring failed", exc_info=True)
+        print(f"could not update cron jobs: {exc}")
+        return 1
+
+
+def _cron_profile_home(name: str):
+    """Hermes home for ``--profile``, or None for the profile this process serves."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
+
+    canonical = normalize_profile_name(name)
+    if not profile_exists(canonical):
+        raise ValueError(f"no Hermes profile named {name!r}")
+    return get_profile_dir(canonical)
+
+
+def _cron_test(chat_id: str, as_json: bool) -> int:
+    """Speak a synthetic cron payload through the same digest/bridge path."""
+    from .standalone import send_standalone
+
+    payload_text = (
+        "Cronjob Response: Google Home test\n"
+        "(job_id: selftest)\n"
+        "-------------\n\n"
+        "This is a cron delivery test. If you can hear this, scheduled jobs "
+        "will speak on this speaker.\n\n"
+        "To stop or manage this job, send me a new message "
+        "(e.g. \"stop reminder Google Home test\")."
+    )
+    result = asyncio.run(send_standalone(None, chat_id, payload_text))
+    ok = bool(result.get("success"))
+    report = {"target": f"googlehome:{chat_id}", "success": ok, "result": result}
+    if as_json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if ok else 1
+    if ok:
+        print("Cron delivery test spoken on the Google Home speaker.")
+        print("If you heard it, a scheduled job with this target will speak too.")
+        return 0
+    print(f"Cron delivery test failed: {result.get('error') or 'unknown error'}")
+    print("Check `hermes googlehome check` and `hermes googlehome cron status`.")
+    return 1
+
+
+def _cron_status(chat_id: str, settings: Any, as_json: bool, *, home: Any, label: str) -> int:
+    ready = cronlink.platform_ready()
+    jobs = cronlink.list_jobs(home=home)
+    attached = [job for job in jobs if job["attached"]]
+    payload = {
+        "profile": label,
+        "target": f"googlehome:{chat_id}",
+        "cron_platform_registered": ready,
+        "speak_cron": settings.speak_cron,
+        "cron_max_chars": settings.cron_max_chars,
+        "jobs_total": len(jobs),
+        "jobs_attached": len(attached),
+        "jobs": jobs,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+
+    print(f"Google Home cron notifications — profile: {label}")
+    print(f"  target:    {payload['target']}")
+    print(
+        "  platform:  "
+        + ("registered for cron delivery" if ready
+           else "NOT registered — the installed plugin is older, or the gateway needs a restart")
+    )
+    print(
+        f"  speech:    {'on' if settings.speak_cron else 'off'}, "
+        f"{settings.cron_max_chars} chars per job"
+    )
+    if not jobs:
+        print("  jobs:      none in this profile")
+        return 0
+
+    print(f"  jobs:      {len(jobs)} total, {len(attached)} attached")
+    for job in jobs:
+        mark = "speaker" if job["attached"] else "       "
+        state = "" if job["enabled"] else " (paused)"
+        print(f"  · [{mark}] {job['name']}{state}")
+        print(f"      deliver: {job['deliver']}")
+        if job["failure_deliver"]:
+            print(f"      failures: {job['failure_deliver']}")
+    return 0
+
+
+def _cron_toggle(
+    state: str, chat_id: str, settings: Any, as_json: bool, *, dry_run: bool,
+    home: Any, label: str,
+) -> int:
+    rows = cronlink.apply_jobs(state, chat_id, dry_run=dry_run, home=home)
+    changed = [row for row in rows if row["changed"]]
+    payload = {
+        "action": state,
+        "dry_run": dry_run,
+        "profile": label,
+        "target": f"googlehome:{chat_id}",
+        "jobs_total": len(rows),
+        "jobs_changed": len(changed),
+        "jobs": rows,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+
+    verb = "attach" if state == "on" else "detach"
+    if not rows:
+        print(f"No cron jobs in profile '{label}' (nothing to {verb}).")
+        return 0
+
+    if dry_run:
+        print(f"Dry run — would {verb} the speaker on profile '{label}':")
+    else:
+        print(f"{'Attached' if state == 'on' else 'Detached'} the speaker on profile '{label}':")
+    print(f"  target: googlehome:{chat_id}\n")
+
+    for row in rows:
+        if row["changed"]:
+            print(f"  · {row['name']}")
+            print(f"      {row['before']}  →  {row['after']}")
+        else:
+            print(f"  · {row['name']}  (already {'attached' if state == 'on' else 'clear'})")
+
+    if changed:
+        print(
+            f"\n{len(changed)} of {len(rows)} job(s) "
+            f"{'would change' if dry_run else 'updated'}."
+        )
+    else:
+        print(f"\nNothing to change; all {len(rows)} job(s) are already in the right state.")
+
+    if state == "on" and not dry_run:
+        print(
+            "The next scheduler tick reads the new delivery list (no gateway restart needed).\n"
+            "Test a job now:  hermes cron run <job-id>"
+        )
+    if state == "off" and not dry_run:
+        local_only = [row for row in changed if row["after"] == "local"]
+        if local_only:
+            print(
+                f"\n{len(local_only)} job(s) now have no delivery target and will only save "
+                "output locally. Add a text target with:\n"
+                "  hermes cron edit <job-id> --deliver <platform>"
+            )
+    if state == "on" and not settings.speak_cron:
+        print(
+            "\nHeads-up: speak_cron is off in this profile's plugin settings, so the jobs will "
+            "deliver to the speaker but stay silent.\n"
+            "  hermes config set plugins.entries.googlehome.settings.speak_cron true"
+        )
+    return 0
 
 
 def _firewall(args: Any) -> int:

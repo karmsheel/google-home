@@ -74,6 +74,9 @@ class CastClient:
         self._transport_id: Optional[str] = None
         self._closed = True
         self.last_status: dict[str, Any] = {}
+        #: The session the last successful LOAD created. ``stop_current()``
+        #: needs it, and it is the only handle the receiver accepts a STOP for.
+        self.media_session_id: Optional[int] = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def connect(self) -> None:
@@ -347,8 +350,13 @@ class CastClient:
             raise CastCommandError(str(status.get("reason") or "LOAD_FAILED"))
         items = status.get("status") or []
         first = items[0] if items else {}
+        session_id = first.get("mediaSessionId")
+        try:
+            self.media_session_id = int(session_id) if session_id is not None else None
+        except (TypeError, ValueError):
+            self.media_session_id = None
         return {
-            "media_session_id": first.get("mediaSessionId"),
+            "media_session_id": session_id,
             "player_state": first.get("playerState"),
             "idle_reason": first.get("idleReason"),
             "duration": first.get("media", {}).get("duration") if first.get("media") else None,
@@ -388,6 +396,28 @@ class CastClient:
         except CastError:
             return
 
+    def stop_current(self) -> bool:
+        """STOP the clip this client loaded, without waiting for an ack.
+
+        Called from another thread while ``wait_until_done`` is reading frames,
+        so it may only send: awaiting a reply here would steal the media status
+        the playback loop is waiting for. Returns whether a STOP was sent.
+        """
+        session_id = self.media_session_id
+        if session_id is not None and self._transport_id:
+            self.stop_media(session_id)
+            return True
+        if self._transport_id:
+            # The receiver never reported a media session (or it was already
+            # lost): stop the application it launched as a best-effort fallback.
+            self._send(
+                p.NS_RECEIVER,
+                p.RECEIVER_ID,
+                {"type": "STOP", "requestId": self._next_request_id()},
+            )
+            return True
+        return False
+
     def play_and_wait(
         self,
         url: str,
@@ -399,34 +429,45 @@ class CastClient:
     ) -> dict[str, Any]:
         """Play a URL and block until the clip finishes (or ``max_wait`` elapses)."""
         started = self.play_url(url, content_type=content_type, title=title, timeout=timeout)
-        if started.get("media_session_id") is None:
-            return started
-        deadline = time.monotonic() + max_wait
-        duration = started.get("duration")
-        if isinstance(duration, (int, float)) and duration > 0:
-            # A known duration is a real upper bound; waiting past it only adds
-            # latency to every voice turn.
-            deadline = min(deadline, time.monotonic() + float(duration) + 4.0)
-        saw_playing = started.get("player_state") == "PLAYING"
-        while time.monotonic() < deadline:
-            time.sleep(0.4)
-            try:
-                status = self.get_media_status(timeout=2.0)
-            except CastError:
-                break
-            state = status.get("playerState")
-            if state == "PLAYING":
-                saw_playing = True
-                continue
-            if state == "IDLE":
-                if saw_playing or status.get("idleReason") in {"FINISHED", "ERROR"}:
-                    return {**started, "finished": True, "idle_reason": status.get("idleReason")}
-                continue
-            # No session at all: the receiver dropped the app after the clip,
-            # which for our purposes is the same outcome as IDLE/FINISHED.
-            if not status and saw_playing:
-                return {**started, "finished": True, "idle_reason": "FINISHED"}
-        return {**started, "finished": False}
+        return self.wait_until_done(started, max_wait=max_wait)
+
+    def wait_until_done(self, started: dict[str, Any], *, max_wait: float = 180.0) -> dict[str, Any]:
+        """Wait for a clip returned by ``play_url`` to leave the PLAYING state.
+
+        Split from ``play_and_wait`` so callers can register a stop hook between
+        LOAD and the wait, which is the window in which the UI shows its control.
+        """
+        try:
+            if started.get("media_session_id") is None:
+                return started
+            deadline = time.monotonic() + max_wait
+            duration = started.get("duration")
+            if isinstance(duration, (int, float)) and duration > 0:
+                # A known duration is a real upper bound; waiting past it only
+                # adds latency to every voice turn.
+                deadline = min(deadline, time.monotonic() + float(duration) + 4.0)
+            saw_playing = started.get("player_state") == "PLAYING"
+            while time.monotonic() < deadline:
+                time.sleep(0.4)
+                try:
+                    status = self.get_media_status(timeout=2.0)
+                except CastError:
+                    break
+                state = status.get("playerState")
+                if state == "PLAYING":
+                    saw_playing = True
+                    continue
+                if state == "IDLE":
+                    if saw_playing or status.get("idleReason") in {"FINISHED", "ERROR"}:
+                        return {**started, "finished": True, "idle_reason": status.get("idleReason")}
+                    continue
+                # No session at all: the receiver dropped the app after the clip,
+                # which for our purposes is the same outcome as IDLE/FINISHED.
+                if not status and saw_playing:
+                    return {**started, "finished": True, "idle_reason": "FINISHED"}
+            return {**started, "finished": False}
+        finally:
+            self.media_session_id = None
 
 
 def probe(host: str, port: int = 8009, timeout: float = 5.0) -> dict[str, Any]:

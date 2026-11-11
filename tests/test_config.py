@@ -44,7 +44,9 @@ class ResolutionOrderTests(unittest.TestCase):
         self.assertEqual(settings.device, "")
         self.assertEqual(settings.speech_backend, "auto")
         self.assertTrue(settings.speak_replies)
+        self.assertTrue(settings.speak_cron)
         self.assertEqual(settings.max_chars, ghconfig.DEFAULT_MAX_CHARS)
+        self.assertEqual(settings.cron_max_chars, ghconfig.DEFAULT_CRON_MAX_CHARS)
         self.assertEqual(settings.control_port, ghconfig.DEFAULT_CONTROL_PORT)
 
     def test_extra_is_used_without_plugin_context(self):
@@ -77,6 +79,16 @@ class ResolutionOrderTests(unittest.TestCase):
         settings = ghconfig.resolve_settings(self._platform({"volume": 900, "max_chars": 1}))
         self.assertEqual(settings.volume, 100)
         self.assertEqual(settings.max_chars, 120)
+
+    def test_cron_chars_are_clamped(self):
+        low = ghconfig.resolve_settings(self._platform({"cron_max_chars": 1}))
+        high = ghconfig.resolve_settings(self._platform({"cron_max_chars": 99999}))
+        self.assertEqual(low.cron_max_chars, 80)
+        self.assertEqual(high.cron_max_chars, 2000)
+
+    def test_cron_speech_can_be_muted(self):
+        settings = ghconfig.resolve_settings(self._platform({"speak_cron": "no"}))
+        self.assertFalse(settings.speak_cron)
 
     def test_bools_parse_common_truthy_strings(self):
         settings = ghconfig.resolve_settings(self._platform({"speak_replies": "no", "restore_volume": "off"}))

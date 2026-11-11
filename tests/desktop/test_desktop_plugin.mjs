@@ -157,6 +157,13 @@ check('registers a status bar chip', () => {
   assert.equal(typeof chip[0].render, 'function')
 })
 
+check('registers the composer speaker control', () => {
+  const composer = byArea('composer.actions')
+  assert.ok(composer.length >= 1)
+  assert.equal(composer[0].id, 'composer-speaker')
+  assert.equal(typeof composer[0].render, 'function')
+})
+
 check('registers a settings page', () => {
   assert.equal(settingsPages.length, 1)
   assert.equal(settingsPages[0].title, 'Google Home')
