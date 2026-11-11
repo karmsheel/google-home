@@ -9,7 +9,7 @@ It has two surfaces in one package:
 
 - **`googlehome/`** — the Python plug-in: a `kind: platform` gateway adapter that
   synthesizes replies, casts them over the Cast v2 protocol, accepts voice from
-  the host microphone, and exposes four tools.
+  the host microphone, and exposes five tools.
 - **`googlehome/desktop/plugin.js`** — the Hermes Desktop extension: a page, a
   sidebar row, a status-bar chip, palette commands, push-to-talk, and settings.
   It is a thin client of the adapter's loopback control API.
@@ -45,7 +45,7 @@ arbitrary media, and third-party Cast SDKs.
 | Python package | `googlehome/` |
 | Plug-in id and platform name | `googlehome` |
 | Display label | Google Home |
-| Tools | `googlehome_speak`, `googlehome_status`, `googlehome_volume`, `googlehome_devices` |
+| Tools | `googlehome_speak`, `googlehome_notify`, `googlehome_status`, `googlehome_volume`, `googlehome_devices` |
 | CLI | `hermes googlehome <action>` |
 | Environment prefix | `GOOGLEHOME_` |
 | Desktop extension id | `googlehome` |
@@ -60,11 +60,12 @@ It never names a project, package, plug-in, module, or setting.
 |---|---|
 | `googlehome/__init__.py` | `register(ctx)`: platform, tools, CLI. Defers core imports. |
 | `googlehome/adapter.py` | The platform adapter: connect, cast, `send()`, voice turns, profile binding. |
-| `googlehome/control.py` | Loopback HTTP API (`/status`, `/playback`, `/devices`, `/ask`, `/speak`, `/stop`, `/listen`, `/device`, `/profile`, `/volume`, `/destination`). |
+| `googlehome/control.py` | Loopback HTTP API (`/status`, `/reply`, `/playback`, `/devices`, `/ask`, `/speak`, `/stop`, `/listen`, `/device`, `/profile`, `/volume`, `/mute`, `/destination`). |
 | `googlehome/playback.py` | In-process registry of audible clips; the stop hooks and the `/playback` snapshot. |
 | `googlehome/ambient.py` | Per-conversation destinations chosen in the composer, and the turn-end hook that speaks them. |
-| `googlehome/tools.py` | The four tools the model can call. |
-| `googlehome/cli.py` | `hermes googlehome check\|devices\|speak\|status\|cron\|firewall`. |
+| `googlehome/tools.py` | The five tools the model can call. |
+| `googlehome/notify.py` | One-line task outcomes, status wording, speaker-name matching. |
+| `googlehome/cli.py` | `hermes googlehome check\|devices\|speak\|notify\|status\|cron\|firewall`. |
 | `googlehome/config.py` | Settings resolution, clamped; state and token paths. |
 | `googlehome/speech.py` | TTS backends: Hermes, Windows SAPI, edge-tts. |
 | `googlehome/castdevice.py`, `castproto.py` | Cast v2 over TLS 8009 and its protobuf envelope. |
@@ -74,7 +75,7 @@ It never names a project, package, plug-in, module, or setting.
 | `googlehome/platform_entry.py` | `PlatformEntry` kwargs, feature-detected. |
 | `googlehome/desktop/plugin.js` | Hermes Desktop extension (single uncompiled file). |
 | `docs/REVERSE_ENGINEERING.md` | Protocol findings; why speaker-in is impossible. |
-| `tests/` | 204 stdlib tests (16 need Hermes core). |
+| `tests/` | 270 stdlib tests (45 need Hermes core); `tests/desktop/` is the plugin.js harness. |
 
 ## How a turn becomes speech
 
@@ -92,6 +93,11 @@ Desktop (push-to-talk) ──POST /listen──▶ control API ──▶ adapter
 Text chat, speaker picked in the composer:
   post_llm_call ──▶ ambient.py (destination for this session)
                      └─ tools.speak_to() ── TTS ── direct cast ──▶ that speaker
+
+Long task, "notify me on the living room speaker when done":
+  googlehome_notify ──▶ notify.py (one line, speaker matched by name)
+                          └─ live adapter if it owns that device,
+                             else tools.speak_to() ── direct cast
 ```
 
 ## Invariants worth preserving
@@ -99,6 +105,17 @@ Text chat, speaker picked in the composer:
 - **The control API is loopback-only and token-gated** (`X-Hermes-Token` from
   `control-token`, mirrored into `control.json`). It can run turns; never widen
   the bind address or drop the token.
+- **The page can see its own turn.** `/ask` and `/listen` return a token and the
+  adapter records the reply (or the failure) under it; `/reply?token=…` serves it.
+  Captures expire (15 min, bounded count). Without this the speaker is the only
+  output and a finished turn looks lost.
+- **The platform is `trusted_inbound`.** Its only inbound door is that
+  token-gated loopback API — no remote sender exists — so the user allowlist and
+  the pairing gate must not apply. Otherwise every turn is answered with a
+  pairing code instead of the agent's reply.
+- **One voice per reply.** Hermes's auto-TTS (`voice.auto_tts`) also hands the
+  final text to `send_voice`; this adapter's `send` already speaks it, so auto-TTS
+  clips are acknowledged and skipped, never cast twice.
 - **The adapter lives in the gateway process.** Tools and the control API reach
   it through `active_adapter()`; it is the only holder of the Cast session.
 - **One speaker per conversation.** `chat_id` is stable so one device keeps one
@@ -110,23 +127,63 @@ Text chat, speaker picked in the composer:
 - **A conversation speaks only if it opted in.** `ambient.py` reads a
   per-session destination; no entry means silence. It skips the `googlehome`
   platform (the adapter already speaks those turns) and turns that already
-  called `googlehome_speak`, so nothing is heard twice.
+  called `googlehome_speak` or `googlehome_notify`, so nothing is heard twice.
 - **Cast is tolerated, not guaranteed.** Google supports the protocol
   begrudgingly; a cast takes over the speaker and adds latency.
 - **Audible output is interruptible.** Every cast path registers with
   `playback.py` between LOAD and the wait, so `/stop` can send the media STOP
   from outside the playback thread. `status()` must never take the speak lock
   while `speaking` — the Desktop's stop control depends on that poll returning.
+- **The status-bar chip is a control, not a link.** It opens a popover (volume,
+  mute, hide composer picker); the page carries the same three controls in a
+  **Speaker controls** box beside the boxed Speaker / Hermes profile rows (one
+  `SpeakerSection`, two columns via a container query at `@lg`), rendered by the
+  one `SpeakerControls` component so the surfaces cannot drift. The two boxes
+  stretch to a shared height (`flex-1` in a stretched grid item) and share the
+  same surface (`bg-quinary` / `stroke-secondary`). The routing rows use
+  `ListRow wide` (picker on the title line) with their explanations in `Tip`s,
+  keeping the left box short. The page column
+  is padded with `px-12`, marked `@container` so the section measures the column
+  (not the window), and sized `min(calc(50% + 24rem), 88rem)` — half the side
+  gutters of a 48rem column, capped for ultrawide panes. The page stays
+  reachable from the
+  sidebar and the palette. While audio is audible the chip is still a stop
+  button, and the popover closes. Mute is a distinct `muted` setting that gates
+  every cast path (adapter `send`, tools `_speak`/`speak_to`, ambient, notify,
+  standalone cron), never the device's volume: a muted reply is still recorded
+  for the page and cast nowhere.
+- **Plugin classes must exist in the compiled Desktop CSS.** The Desktop builds
+  Tailwind at build time and loads `plugin.js` at runtime, so a class the build
+  never emitted silently does nothing (`max-w-4xl`, `lg:grid-cols-2` were both
+  no-ops). Use classes that already appear in the shipped CSS, prefer container
+  queries (`@container` + `@lg:`), and run
+  `node tests/desktop/class-coverage.cjs <dist/assets/*.css> googlehome/desktop/plugin.js`;
+  the harness runs the same check automatically when `HERMES_HOME` holds a build.
+- **A notification is one line, never the reply.** `googlehome_notify` composes
+  `Task complete|blocked|failed: …` from the model's short label; it never
+  accepts the final answer. It also counts as a speaking tool, so a conversation
+  pointed at that speaker does not read the whole reply afterwards.
+- **A named speaker is matched, never guessed.** `notify.resolve_target` skips
+  mDNS for an address, matches names token-wise ("living room speaker" finds
+  "Living Room speaker"), and raises with the available names rather than
+  falling back to the first speaker when the room is unknown or ambiguous.
 - **Markdown is flattened before speech** and clipped at a sentence boundary.
+- **Reasoning is never spoken.** `display.show_reasoning` prepends a `💭`
+  reasoning block for on-screen surfaces; the adapter strips a leading rendered
+  block before speaking (and before the page shows it), and
+  `display.platforms.googlehome.show_reasoning: false` stops the gateway
+  producing it for this platform at all.
 
 ## Working on it
 
 ```powershell
-python -m unittest discover -s tests -t .        # 204 stdlib tests
+python -m unittest discover -s tests -t .        # 270 stdlib tests
+node tests/desktop/test_desktop_plugin.mjs       # plugin.js loader/render/behaviour harness
 hermes plugins doctor googlehome                 # manifest, import, register
 hermes googlehome check                          # speaker reachability
 hermes googlehome devices                        # mDNS scan
 hermes googlehome speak --text "hello"           # one sentence
+hermes googlehome notify --status done --task "the build"   # one-line outcome
 ```
 
 The package is developed in this directory and linked into Hermes:

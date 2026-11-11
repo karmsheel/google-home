@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import sys
 import tempfile
@@ -501,7 +502,13 @@ class RegistrationTests(unittest.TestCase):
         names = {tool["name"] for tool in ctx.tools}
         self.assertEqual(
             names,
-            {"googlehome_speak", "googlehome_status", "googlehome_volume", "googlehome_devices"},
+            {
+                "googlehome_speak",
+                "googlehome_notify",
+                "googlehome_status",
+                "googlehome_volume",
+                "googlehome_devices",
+            },
         )
         for tool in ctx.tools:
             self.assertEqual(tool["toolset"], "googlehome")
@@ -537,6 +544,117 @@ class RegistrationTests(unittest.TestCase):
 
         googlehome.register(ctx)
         self.assertEqual(set(manifest["provides_tools"]), {tool["name"] for tool in ctx.tools})
+
+
+@unittest.skipUnless(CORE_AVAILABLE, "Hermes core (gateway.*) not importable")
+class NotifyToolTests(unittest.TestCase):
+    """The agent-facing handler picks the conversation's speaker by default."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        self.env = mock.patch.dict(
+            os.environ, {"HERMES_HOME": self.tmp.name}, clear=False
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        from googlehome import ambient
+
+        ambient.clear_destination("s1")
+
+    def test_defaults_to_the_conversations_chosen_speaker(self):
+        from googlehome import ambient, tools
+
+        ambient.set_destination(
+            "s1", "speaker", device="192.168.1.145", name="Living Room speaker"
+        )
+        with mock.patch.object(
+            tools.notify, "announce", return_value={"ok": True}
+        ) as announce:
+            result = json.loads(
+                tools._handle_notify({"status": "done", "task": "the report"}, session_id="s1")
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(announce.call_args.kwargs["speaker"], "192.168.1.145")
+        self.assertEqual(announce.call_args.args[0], "done")
+
+    def test_an_explicit_speaker_wins(self):
+        from googlehome import ambient, tools
+
+        ambient.set_destination("s1", "speaker", device="192.168.1.145")
+        with mock.patch.object(
+            tools.notify, "announce", return_value={"ok": True}
+        ) as announce:
+            tools._handle_notify(
+                {"status": "blocked", "speaker": "kitchen speaker"}, session_id="s1"
+            )
+        self.assertEqual(announce.call_args.kwargs["speaker"], "kitchen speaker")
+
+    def test_an_off_conversation_uses_the_configured_speaker(self):
+        from googlehome import ambient, tools
+
+        ambient.set_destination("s1", "off")
+        with mock.patch.object(
+            tools.notify, "announce", return_value={"ok": True}
+        ) as announce:
+            tools._handle_notify({"status": "done"}, session_id="s1")
+        self.assertEqual(announce.call_args.kwargs["speaker"], "")
+
+    def test_cast_reuses_the_live_adapter_for_the_same_speaker(self):
+        from googlehome import config as ghconfig
+        from googlehome import notify, tools
+
+        adapter = mock.Mock()
+        adapter._device = {"host": "192.168.1.145"}
+        with mock.patch.object(tools, "active_adapter", return_value=adapter), \
+             mock.patch.object(
+                 tools, "_speak", return_value={"ok": True, "device": "Living Room speaker"}
+             ) as speak, \
+             mock.patch.object(tools, "speak_to") as direct:
+            result = notify._cast(
+                "line", {"host": "192.168.1.145"}, ghconfig.Settings()
+            )
+        speak.assert_called_once_with("line")
+        direct.assert_not_called()
+        self.assertEqual(result["via"], "gateway")
+
+    def test_cast_uses_the_direct_path_for_another_speaker(self):
+        from googlehome import config as ghconfig
+        from googlehome import notify, tools
+
+        adapter = mock.Mock()
+        adapter._device = {"host": "192.168.1.146"}
+        with mock.patch.object(tools, "active_adapter", return_value=adapter), \
+             mock.patch.object(tools, "_speak") as speak, \
+             mock.patch.object(
+                 tools, "speak_to", return_value={"ok": True, "device": "Living Room speaker"}
+             ) as direct:
+            result = notify._cast(
+                "line",
+                {"host": "192.168.1.145"},
+                ghconfig.Settings(device="192.168.1.145"),
+            )
+        speak.assert_not_called()
+        self.assertEqual(direct.call_args.kwargs["source"], "notify")
+        self.assertEqual(direct.call_args.args[1].device, "192.168.1.145")
+        self.assertEqual(result["via"], "direct")
+
+    def test_an_unknown_speaker_is_reported_as_data(self):
+        from googlehome import tools
+
+        with mock.patch.object(
+            tools.notify,
+            "announce",
+            side_effect=tools.notify.SpeakerLookupError(
+                "No speaker matches 'attic'.", ["Living Room speaker (192.168.1.145)"]
+            ),
+        ):
+            result = json.loads(
+                tools._handle_notify({"status": "done", "speaker": "attic"})
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["kind"], "speaker_not_found")
+        self.assertEqual(result["available_speakers"], ["Living Room speaker (192.168.1.145)"])
 
 
 if __name__ == "__main__":

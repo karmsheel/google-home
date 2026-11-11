@@ -40,7 +40,6 @@ def build_platform_kwargs(*, ctx: Any, adapter: Any, check_fn: Any, validate_con
     """Assemble the kwargs for ``ctx.register_platform``."""
     from . import PLATFORM_NAME
     from .standalone import send_standalone
-    from .standalone import send_standalone
 
     kwargs: dict[str, Any] = {
         "name": PLATFORM_NAME,
@@ -75,6 +74,14 @@ def build_platform_kwargs(*, ctx: Any, adapter: Any, check_fn: Any, validate_con
         # restart-safe workers) where no live adapter exists. This sender asks
         # the running bridge to speak, falling back to an inline cast.
         "standalone_sender_fn": send_standalone,
+        # Every inbound turn is produced by this adapter's own loopback control
+        # API (the host microphone page), never by a remote sender: the only
+        # door in is token-gated and bound to 127.0.0.1. So the user allowlist
+        # and the pairing gate do not apply — the same contract as Home
+        # Assistant's event bus. Without this, an unapproved `user_id="speaker"`
+        # makes every turn answer with a pairing code instead of the agent's
+        # reply, which reads exactly like a lost conversation.
+        "trusted_inbound": True,
     }
     supported = _supported_fields()
     for key, value in optional.items():

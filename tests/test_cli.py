@@ -41,6 +41,23 @@ class ParserTests(unittest.TestCase):
         args = self._parser().parse_args(["speak", "good", "morning"])
         self.assertEqual(args.text, ["good", "morning"])
 
+    def test_notify_parses_the_short_form(self):
+        args = self._parser().parse_args([
+            "notify", "--status", "blocked", "--task", "the deploy",
+            "--detail", "API key", "--speaker", "living room", "--json",
+        ])
+        self.assertEqual(args.googlehome_action, "notify")
+        self.assertEqual(args.status, "blocked")
+        self.assertEqual(args.task, "the deploy")
+        self.assertEqual(args.detail, "API key")
+        self.assertEqual(args.speaker, "living room")
+        self.assertTrue(args.json)
+
+    def test_notify_defaults_to_done(self):
+        args = self._parser().parse_args(["notify"])
+        self.assertEqual(args.status, "done")
+        self.assertEqual(args.speaker, "")
+
     def test_firewall_port_override(self):
         args = self._parser().parse_args(["firewall", "--port", "8766"])
         self.assertEqual(args.port, 8766)
@@ -81,6 +98,46 @@ class ToneTests(unittest.TestCase):
                 self.assertEqual(handle.getsampwidth(), 2)
                 self.assertEqual(handle.getframerate(), 16000)
                 self.assertGreater(handle.getnframes(), 1000)
+
+
+class NotifyCommandTests(unittest.TestCase):
+    def _run(self, args: argparse.Namespace) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli._notify_action(args)
+        return code, buffer.getvalue()
+
+    def test_prints_the_line_and_where_it_was_spoken(self):
+        with mock.patch.object(cli, "_settings", return_value=ghconfig.Settings()), \
+             mock.patch("googlehome.notify.announce", return_value={
+                 "ok": True,
+                 "spoken": "Task complete: the report. Waiting for your review.",
+                 "device": "Living Room speaker",
+                 "via": "direct",
+             }):
+            code, output = self._run(argparse.Namespace(
+                status="done", task="the report", detail="", speaker="",
+                json=False,
+            ))
+        self.assertEqual(code, 0)
+        self.assertIn("Task complete: the report.", output)
+        self.assertIn("Living Room speaker", output)
+
+    def test_an_unknown_speaker_lists_the_alternatives(self):
+        from googlehome import notify
+
+        with mock.patch.object(cli, "_settings", return_value=ghconfig.Settings()), \
+             mock.patch.object(
+                 notify, "announce",
+                 side_effect=notify.SpeakerLookupError(
+                     "No speaker matches 'attic'.", ["Living Room speaker (192.168.1.145)"]
+                 ),
+             ):
+            code, output = self._run(argparse.Namespace(
+                status="done", task="", detail="", speaker="attic", json=False,
+            ))
+        self.assertEqual(code, 1)
+        self.assertIn("available: Living Room speaker", output)
 
 
 class ControlFileTests(unittest.TestCase):

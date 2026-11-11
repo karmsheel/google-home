@@ -90,6 +90,9 @@ class Settings:
     token_required: bool = True
     speak_replies: bool = True
     speak_cron: bool = True
+    # Silence-all switch from the Desktop's status-bar popover. Separate from
+    # ``speak_replies`` because it also mutes tools, notifications and cron.
+    muted: bool = False
     restore_volume: bool = True
     # Secondary multiplex profile: forward speech to the primary bridge instead
     # of opening a second Cast connection and media server for the same speaker.
@@ -190,6 +193,7 @@ def resolve_settings(config: Any = None) -> Settings:
         token_required=_as_bool(pick("token_required"), True),
         speak_replies=_as_bool(pick("speak_replies"), True),
         speak_cron=_as_bool(pick("speak_cron"), True),
+        muted=_as_bool(pick("muted"), False),
         restore_volume=_as_bool(pick("restore_volume"), True),
         proxy=_as_bool(pick("proxy"), False),
         extra=extra,

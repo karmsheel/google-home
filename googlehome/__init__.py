@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 PLUGIN_NAME = "googlehome"
 PLATFORM_NAME = "googlehome"
 __all__ = ["register", "PLUGIN_NAME", "PLATFORM_NAME", "__version__"]
@@ -46,11 +46,12 @@ def register(ctx: Any) -> None:
     ambient.register_hooks(ctx)
     ctx.register_cli_command(
         name="googlehome",
-        help="Google Home speaker bridge: check, devices, speak, status, firewall",
+        help="Google Home speaker bridge: check, devices, speak, notify, status, firewall",
         description=(
             "Check that a Google Home / Nest speaker is reachable and can play audio "
-            "from this machine, list Cast devices, speak a phrase, read the running "
-            "bridge status, or open the media port in Windows Firewall."
+            "from this machine, list Cast devices, speak a phrase, announce a "
+            "one-line task outcome, read the running bridge status, or open the "
+            "media port in Windows Firewall."
         ),
         setup_fn=setup_cli,
         handler_fn=run_action,

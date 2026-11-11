@@ -47,11 +47,29 @@ const PLUGIN_ID = 'googlehome'
 const ROUTE = '/googlehome'
 const CONTROL_TTL_MS = 5000
 const STATUS_POLL_MS = 3000
+// A turn can take minutes (tools, approvals). The page keeps polling without
+// holding the talk button hostage, then settles on whatever the bridge recorded.
+const REPLY_POLL_MS = 700
+const REPLY_TIMEOUT_MS = 15 * 60 * 1000
+const REPLY_SETTLE_MS = 1600
 
 // Read through the namespace import so an older shell without the composer
 // seam simply hides the control instead of failing to load the module.
 const COMPOSER_AREAS = sdk.COMPOSER_AREAS
+const SESSION_ROW_AREAS = sdk.SESSION_ROW_AREAS
 const SDK_ICONS = sdk.icons
+// The status-bar chip opens a small speaker popover instead of navigating to
+// the page. Read through the namespace (not the named import) so a Desktop
+// older than the popover simply keeps the route it has always opened.
+const SDK_POPOVER = {
+  root: sdk.Popover,
+  content: sdk.PopoverContent,
+  trigger: sdk.PopoverTrigger,
+  toggle: sdk.Switch
+}
+const HAS_POPOVER = Boolean(
+  SDK_POPOVER.root && SDK_POPOVER.content && SDK_POPOVER.trigger && SDK_POPOVER.toggle
+)
 
 const $status = atom({ kind: 'idle' })
 const $devices = atom([])
@@ -60,16 +78,39 @@ const $recording = atom(false)
 const $busy = atom(false)
 const $transcript = atom('')
 const $reply = atom('')
+const $replyError = atom('')
+// A submitted turn whose reply has not landed yet. Separate from `$busy` so the
+// microphone is usable while the agent is still thinking.
+const $waiting = atom(false)
+const $turnToken = atom('')
+// Google Home conversations, read from the routed profile's own store. This is
+// what makes the session findable: the Desktop files it under "Googlehome" with
+// a title from its first message, not under a speaker section.
+const $conversations = atom({ kind: 'idle', rows: [], error: '' })
+const $conversationIds = atom([])
 const $notice = atom('')
 // Cheap one-second poll of /playback. It says whether agent audio is audible
 // right now, which is what turns the status chip into a stop control.
 const $playback = atom({ speaking: false, kind: 'idle' })
+// The chip's speaker popover, and the one preference it owns. Both are UI
+// state, not adapter state: "hide the picker" never stops a conversation from
+// speaking, it only gives the composer back.
+const $chipOpen = atom(false)
+const $composerHidden = atom(false)
 
 let control = { info: null, at: 0 }
 let recorder = null
 let chunks = []
 let noticeTimer = null
 let pollTimer = null
+let volumeTimer = null
+// Plugin-scoped persistence, handed over by register(); a missing door keeps
+// the popover working for this run and simply forgets the picker preference.
+let pluginStorage = null
+const COMPOSER_HIDDEN_KEY = 'composerPickerHidden'
+// Which profile the conversations list was last read for; the routed profile
+// can change under us (a settings edit, a profile_routes change).
+let sessionsProfile = ''
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function errorText(error, fallback) {
@@ -171,6 +212,13 @@ async function refreshStatus() {
   try {
     const status = await bridgeApi('/status')
     $status.set({ kind: 'ready', status })
+    const profile = String(status.routed_profile || status.profile || '').trim()
+    // A different routed profile means a different session store: re-read the
+    // conversations so the page never shows another agent's turns.
+    if (profile && profile !== sessionsProfile) {
+      sessionsProfile = profile
+      void loadConversations({ force: true })
+    }
   } catch (error) {
     $status.set({ kind: 'error', message: errorText(error, 'Bridge unreachable') })
   }
@@ -204,6 +252,49 @@ async function stopSpeaking() {
   }
 }
 
+/** Persisted "hide the composer picker" choice; false when the door is absent. */
+function readComposerHidden() {
+  try {
+    return Boolean(pluginStorage && pluginStorage.get(COMPOSER_HIDDEN_KEY, false))
+  } catch {
+    return false
+  }
+}
+
+function setComposerHidden(hidden) {
+  const next = Boolean(hidden)
+  $composerHidden.set(next)
+  try {
+    if (pluginStorage) pluginStorage.set(COMPOSER_HIDDEN_KEY, next)
+  } catch {
+    /* a broken store must not make the picker un-hideable */
+  }
+}
+
+/** Commit a slider level to the device (and to the adapter's cast volume). */
+async function setSpeakerVolume(level) {
+  const value = Math.max(0, Math.min(100, Math.round(Number(level) || 0)))
+  try {
+    await bridgeApi('/volume', { method: 'POST', body: { level: value } })
+    await refreshStatus()
+  } catch (error) {
+    say(errorText(error, 'Could not set the speaker volume'))
+  }
+}
+
+/** Silence (or resume) spoken replies without losing them on the page. */
+async function setSpeakerMuted(muted) {
+  const next = Boolean(muted)
+  hapticTap()
+  try {
+    await bridgeApi('/mute', { method: 'POST', body: { muted: next } })
+    await refreshStatus()
+    say(next ? 'Speaker muted' : 'Speaker unmuted')
+  } catch (error) {
+    say(errorText(error, 'Could not mute the speaker'))
+  }
+}
+
 async function loadDevices() {
   try {
     const result = await bridgeApi('/devices')
@@ -220,6 +311,122 @@ async function loadProfiles() {
     $profiles.set(rows.map(row => String(row.name || '')).filter(Boolean))
   } catch {
     $profiles.set([])
+  }
+}
+
+// ── replies the page would otherwise never see ──────────────────────────────
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+/** The profile whose session store holds this speaker's conversations. */
+function sessionProfile() {
+  const state = $status.get()
+  const status = (state && state.status) || {}
+  const routed = String(status.routed_profile || status.profile || '').trim()
+  if (routed) return routed
+  try {
+    const ref = host.state && host.state.profile
+    return ref && typeof ref.get === 'function' ? String(ref.get() || '').trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+async function readGoogleHomeSessions() {
+  if (typeof host.listPersistedSessions !== 'function') return []
+  const profile = sessionProfile() || 'default'
+  const result = await host.listPersistedSessions(null, { profile, limit: 200 })
+  return ((result && result.sessions) || [])
+    .filter(row => String((row && row.source) || '').toLowerCase() === 'googlehome')
+    .map(row => ({ ...row, profile: String(row.profile || profile) }))
+    .sort((left, right) => (right.last_active || right.started_at || 0) - (left.last_active || left.started_at || 0))
+}
+
+async function loadConversations(options) {
+  const force = Boolean(options && options.force)
+  if (!force && $conversations.get().kind === 'loading') return
+  $conversations.set({ ...$conversations.get(), kind: 'loading' })
+  try {
+    const rows = await readGoogleHomeSessions()
+    $conversations.set({ kind: 'ready', rows, error: '' })
+    $conversationIds.set(rows.map(row => String(row.id || '')).filter(Boolean))
+  } catch (error) {
+    $conversations.set({
+      ...$conversations.get(),
+      kind: 'error',
+      error: errorText(error, 'Could not read the Google Home conversations')
+    })
+  }
+}
+
+async function openConversation(row) {
+  if (!row || !row.id) return
+  if (typeof host.openSession !== 'function') {
+    say('This Hermes build cannot open conversations.')
+    return
+  }
+  hapticTap()
+  try {
+    await host.openSession(String(row.id), row.profile ? { profile: String(row.profile) } : {})
+  } catch (error) {
+    say(errorText(error, 'Could not open that conversation'))
+  }
+}
+
+async function readReply(token) {
+  const result = await bridgeApi(`/reply?token=${encodeURIComponent(token)}`)
+  if (!result || result.ok === false) {
+    return { done: true, reply: '', error: (result && result.error) || 'this turn expired' }
+  }
+  return result
+}
+
+/** Follow one submitted turn to its reply and paint it on the page. */
+async function watchReply(token) {
+  if (!token) return
+  $turnToken.set(token)
+  $waiting.set(true)
+  const deadline = Date.now() + REPLY_TIMEOUT_MS
+  let lastError = ''
+  try {
+    while (Date.now() < deadline) {
+      await sleep(REPLY_POLL_MS)
+      let state
+      try {
+        state = await readReply(token)
+      } catch (error) {
+        lastError = errorText(error, 'Could not read the reply')
+        continue
+      }
+      if (!state.done) continue
+      if (state.error) {
+        // The gateway retries a failed send once with a plain-text fallback;
+        // give that retry the chance to replace the error with the reply.
+        await sleep(REPLY_SETTLE_MS)
+        try {
+          state = await readReply(token)
+        } catch {
+          /* keep the first answer */
+        }
+      }
+      if ($turnToken.get() !== token) return
+      if (state.reply) $reply.set(state.reply)
+      if (state.error) $replyError.set(state.error)
+      if (!state.reply && !state.error) {
+        $reply.set('The reply was spoken. Hermes did not give the bridge its text.')
+      }
+      return
+    }
+    if ($turnToken.get() === token) {
+      $replyError.set(
+        lastError ||
+          'No reply arrived yet. The turn may still be running — open the conversation to follow it.'
+      )
+    }
+  } finally {
+    if ($turnToken.get() === token) $waiting.set(false)
+    // The first turn of a conversation creates the session row; pick it up so
+    // "Open the conversation" and the sidebar badge appear without a reload.
+    void loadConversations({ force: true })
   }
 }
 
@@ -314,7 +521,10 @@ async function stopRecording() {
     if (result.transcript) {
       $transcript.set(result.transcript)
       $reply.set('')
+      $replyError.set('')
       hapticTap()
+      if (result.submitted && result.token) void watchReply(result.token)
+      else if (result.error) $replyError.set(result.error)
     } else {
       $transcript.set('(no speech detected)')
     }
@@ -331,12 +541,15 @@ async function askText(text) {
   if (!trimmed) return
   $busy.set(true)
   $reply.set('')
+  $replyError.set('')
   try {
-    await bridgeApi('/ask', { method: 'POST', body: { text: trimmed } })
+    const result = await bridgeApi('/ask', { method: 'POST', body: { text: trimmed } })
     $transcript.set(trimmed)
-    say('Sent to the speaker')
+    if (result.submitted && result.token) void watchReply(result.token)
+    else $replyError.set(result.error || 'The gateway did not accept the turn.')
   } catch (error) {
     say(errorText(error, 'Could not send that'))
+    $replyError.set(errorText(error, 'Could not send that'))
   } finally {
     $busy.set(false)
   }
@@ -479,7 +692,13 @@ function StatusHeader() {
         className: 'flex flex-wrap items-center gap-2',
         children: [
           jsx('span', { className: 'text-base font-medium text-(--ui-text-primary)', children: statusSummary(statusState) }),
-          status.profile ? jsx(Chip, { children: `profile: ${status.profile}` }) : null,
+          status.routed_profile || status.profile
+            ? jsx(Chip, {
+                children: `profile: ${status.routed_profile || status.profile}${
+                  status.profile_overridden ? ' · routed' : ''
+                }`
+              })
+            : null,
           typeof status.device?.volume === 'number'
             ? jsx(Chip, { children: `volume ${Math.round(status.device.volume * 100)}%` })
             : null,
@@ -517,23 +736,39 @@ function ConnectionRow() {
   const bindProfile = async value => {
     hapticTap()
     try {
-      await bridgeApi('/profile', { method: 'POST', body: { profile: value } })
+      const result = await bridgeApi('/profile', { method: 'POST', body: { profile: value } })
+      const next = (result && result.status) || {}
+      // Selecting a profile the gateway's routes override would be a silent lie:
+      // say who really answers instead of claiming the choice took effect.
+      if (next.profile_overridden) {
+        say(`Gateway routing sends this platform to ${next.routed_profile} — that profile answers.`)
+      } else {
+        say('Profile updated')
+      }
       await refreshStatus()
-      say('Profile updated')
     } catch (error) {
       say(errorText(error, 'Could not change the profile'))
     }
   }
 
   const deviceValue = device.address || device.host || ''
-  const profileValue = status.profile || ''
+  const profileValue = status.routed_profile || status.profile || ''
+  const routedProfile = String(status.routed_profile || '')
+  const configuredProfile = String(status.profile || '')
+  const profileOverridden = Boolean(status.profile_overridden) || Boolean(routedProfile && routedProfile !== configuredProfile)
 
   return jsxs('div', {
     className: 'flex flex-col gap-2',
     children: [
+      // `wide` puts the Select on the title line instead of under it, which is
+      // both the "picker beside its name" layout and one control-row shorter.
+      // The one-line explanations live in the tooltips, not in the box.
       jsx(ListRow, {
-        title: 'Speaker',
-        description: 'The device that will voice this profile.',
+        wide: true,
+        title: jsx(Tip, {
+          label: 'The device that will voice this profile.',
+          children: jsx('span', { children: 'Speaker' })
+        }),
         action: jsxs(Select, {
           value: deviceValue,
           onValueChange: value => void bindDevice(value),
@@ -557,8 +792,16 @@ function ConnectionRow() {
         })
       }),
       jsx(ListRow, {
-        title: 'Hermes profile',
-        description: 'Who answers when you talk to the speaker.',
+        wide: true,
+        title: jsx(Tip, {
+          label: 'Who answers when you talk to the speaker.',
+          children: jsx('span', { children: 'Hermes profile' })
+        }),
+        // Only the override warning earns a visible line: it says the Select
+        // cannot do what it looks like it does.
+        description: profileOverridden
+          ? `Answers come from ${routedProfile || 'the gateway default'} — the gateway's profile_routes sends this platform there, so this selector cannot change it.`
+          : '',
         action: jsxs(Select, {
           value: profileValue,
           onValueChange: value => void bindProfile(value),
@@ -576,16 +819,74 @@ function ConnectionRow() {
   })
 }
 
+/**
+ * Routing on the left, the speaker's quick controls on the right.
+ *
+ * The two routing rows used to run the full page width, which pushed every
+ * Select to the far edge and left a dead gap between a row's label and its
+ * control. Half the width puts each ListRow under its own `@2xl` breakpoint,
+ * so the control sits under the description instead of across a canyon.
+ */
+function SpeakerSection() {
+  return jsxs('div', {
+    // A container query, not a viewport one: the page is capped at max-w-3xl,
+    // so the section must react to its own column width. `@container` lives on
+    // the page column; every class here exists in the compiled Desktop CSS.
+    className: HAS_POPOVER ? 'grid gap-6 @lg:grid-cols-2' : 'grid gap-6',
+    children: [
+      jsxs('div', {
+        className: 'flex min-w-0 flex-col gap-2',
+        children: [
+          jsx('span', {
+            className:
+              'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+            children: 'Speaker & profile'
+          }),
+          // The two cards stretch with the grid row, so this one matches the
+          // Speaker controls card height whichever is taller, and they share
+          // the same surface so the section reads as one block.
+          jsx('div', {
+            className:
+              'flex-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) p-4',
+            children: jsx(ConnectionRow, {})
+          })
+        ]
+      }),
+      HAS_POPOVER
+        ? jsxs('div', {
+            className: 'flex min-w-0 flex-col gap-2',
+            children: [
+              jsx('span', {
+                className:
+                  'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+                children: 'Speaker controls'
+              }),
+              jsx('div', {
+                className:
+                  'flex-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) p-4',
+                children: jsx(SpeakerControls, {})
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
 function Conversation() {
   const transcript = useValue($transcript)
   const reply = useValue($reply)
+  const replyError = useValue($replyError)
   const busy = useValue($busy)
+  const waiting = useValue($waiting)
+  const conversations = useValue($conversations)
+  const latest = (conversations.rows || [])[0] || null
 
-  if (!transcript && !reply) {
+  if (!transcript && !reply && !replyError) {
     return jsx('p', {
       className: 'text-sm text-(--ui-text-tertiary)',
       children:
-        'Press the microphone, say what you want, then press it again. The speaker answers out loud.'
+        'Press the microphone, say what you want, then press it again. The speaker answers out loud, and the reply appears here too.'
     })
   }
 
@@ -601,10 +902,116 @@ function Conversation() {
             ]
           })
         : null,
-      busy
-        ? jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: 'Working…' })
+      busy || waiting
+        ? jsx('span', {
+            className: 'text-xs text-(--ui-text-tertiary)',
+            children: busy ? 'Working…' : 'Waiting for the reply…'
+          })
+        : null,
+      reply
+        ? jsxs('div', {
+            className: 'flex flex-col gap-0.5',
+            children: [
+              jsx('span', { className: 'text-xs uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Hermes said' }),
+              jsx('span', { className: 'whitespace-pre-wrap text-(--ui-text-primary)', children: reply })
+            ]
+          })
+        : null,
+      replyError
+        ? jsx('p', { className: 'text-xs text-(--ui-red)', children: replyError })
+        : null,
+      latest
+        ? jsx(Button, {
+            variant: 'outline',
+            className: 'h-7 self-start px-2 text-xs',
+            onClick: () => void openConversation(latest),
+            children: 'Open the conversation'
+          })
         : null
     ]
+  })
+}
+
+/** One saved Google Home conversation: clicking opens it like any chat. */
+function ConversationRow({ row }) {
+  const title = String(row.title || '').trim() || 'Google Home conversation'
+  const when = relativeWhen(row.last_active || row.started_at)
+  return jsxs('button', {
+    type: 'button',
+    className:
+      'flex w-full items-baseline justify-between gap-3 rounded-md px-2 py-1 text-left text-sm hover:bg-(--ui-row-hover-background)',
+    title: `Open "${title}"`,
+    onClick: () => void openConversation(row),
+    children: [
+      jsx('span', { className: 'truncate text-(--ui-text-primary)', children: title }),
+      when ? jsx('span', { className: 'shrink-0 text-xs text-(--ui-text-tertiary)', children: when }) : null
+    ]
+  })
+}
+
+function Conversations() {
+  const state = useValue($conversations)
+  useEffect(() => {
+    void loadConversations()
+  }, [])
+  const rows = state.rows || []
+  const visible = rows.slice(0, 6)
+  return jsxs('div', {
+    className: 'flex flex-col gap-2',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2',
+        children: [
+          jsx('span', { className: 'text-sm font-medium text-(--ui-text-primary)', children: 'Conversations with this speaker' }),
+          jsx(Button, {
+            variant: 'ghost',
+            className: 'h-7 px-2 text-xs',
+            onClick: () => void loadConversations({ force: true }),
+            children: 'Refresh'
+          })
+        ]
+      }),
+      state.error
+        ? jsx('p', { className: 'text-xs text-(--ui-red)', children: state.error })
+        : null,
+      state.kind === 'loading' && !rows.length
+        ? jsx('p', { className: 'text-xs text-(--ui-text-tertiary)', children: 'Loading…' })
+        : visible.length
+          ? jsxs('div', {
+              className: 'flex flex-col gap-0.5',
+              children: visible.map(row => jsx(ConversationRow, { row }, String(row.id)))
+            })
+          : jsx('p', {
+              className: 'text-xs text-(--ui-text-tertiary)',
+              children:
+                'No conversations yet. Your first turn starts one, and it is saved with the profile that answered — open it here or from the sidebar.'
+            })
+    ]
+  })
+}
+
+/** "just now" / "12m ago" / a date, from the rows' epoch seconds. */
+function relativeWhen(seconds) {
+  const value = Number(seconds || 0) * 1000
+  if (!value) return ''
+  const delta = Date.now() - value
+  if (delta < 0) return ''
+  if (delta < 60 * 1000) return 'just now'
+  if (delta < 60 * 60 * 1000) return `${Math.max(1, Math.round(delta / 60000))}m ago`
+  if (delta < 24 * 60 * 60 * 1000) return `${Math.round(delta / 3600000)}h ago`
+  return new Date(value).toLocaleDateString()
+}
+
+/** Marks the speaker's session where it appears in the sidebar's Recents. */
+function GoogleHomeRowBadge({ sessionId }) {
+  const ids = useValue($conversationIds)
+  const id = String(sessionId || '')
+  if (!id || !ids.includes(id)) return null
+  return jsx('span', {
+    className:
+      'shrink-0 rounded-full border border-(--ui-border) px-1.5 text-[0.625rem] text-(--ui-text-tertiary)',
+    title: 'Conversation with the Google Home speaker',
+    children: 'Google Home'
   })
 }
 
@@ -630,7 +1037,7 @@ function QuickAsk() {
     children: [
       jsx('input', {
         className:
-          'h-8 flex-1 rounded-md border border-(--ui-border) bg-transparent px-2 text-sm text-(--ui-text-primary) outline-none focus:border-(--ui-accent)',
+          'h-8 flex-1 rounded-md border border-(--ui-border) bg-transparent px-2 text-sm text-(--ui-text-primary) outline-none focus:border-(--ui-stroke-secondary)',
         placeholder: 'Type instead of talking…',
         value: draft,
         onChange: event => setDraft(event.target.value)
@@ -669,26 +1076,35 @@ function BridgePage() {
     await refreshStatus()
   }
 
-  return jsxs('div', {
-    className: 'flex h-full flex-col gap-4 overflow-y-auto p-4',
-    children: [
-      jsx(StatusHeader, {}),
-      jsxs('div', {
-        className: 'flex items-center gap-2',
-        children: [
-          jsx(TalkButton, {}),
-          playback && playback.speaking ? jsx(StopSpeakingButton, {}) : null,
-          jsx(Button, { variant: 'ghost', onClick: () => void rescan(), children: 'Rescan speaker' })
-        ]
-      }),
-      jsx(Conversation, {}),
-      jsx(QuickAsk, {}),
-      jsx('div', { className: 'my-1 h-px bg-(--ui-border)' }),
-      jsx(ConnectionRow, {}),
-      statusState && statusState.kind === 'error'
-        ? jsx('p', { className: 'text-xs text-(--ui-red)', children: statusState.message })
-        : null
-    ]
+  return jsx('div', {
+    className: 'h-full overflow-y-auto',
+    children: jsxs('div', {
+      // Side gutters are exactly half of a max-w-3xl (48rem) column's gutters:
+      // the cap is (pane + 48rem) / 2 = 50% + 24rem, so the empty space on each
+      // side halves at every window width. 88rem stops the boxes stretching
+      // across an ultrawide pane. The column is also the container the
+      // two-column settings section measures.
+      className: 'mx-auto flex w-full @container flex-col gap-4 px-12 py-6',
+      style: { maxWidth: 'min(calc(50% + 24rem), 88rem)' },
+      children: [
+        jsx(StatusHeader, {}),
+        jsxs('div', {
+          className: 'flex items-center gap-2',
+          children: [
+            jsx(TalkButton, {}),
+            playback && playback.speaking ? jsx(StopSpeakingButton, {}) : null,
+            jsx(Button, { variant: 'ghost', onClick: () => void rescan(), children: 'Rescan speaker' })
+          ]
+        }),
+        jsx(Conversation, {}),
+        jsx(QuickAsk, {}),
+        jsx(Conversations, {}),
+        jsx(SpeakerSection, {}),
+        statusState && statusState.kind === 'error'
+          ? jsx('p', { className: 'text-xs text-(--ui-red)', children: statusState.message })
+          : null
+      ]
+    })
   })
 }
 
@@ -738,7 +1154,7 @@ function SettingsPage() {
       jsxs('p', {
         className: 'text-xs text-(--ui-text-quaternary)',
         children: [
-          jsx('span', { children: 'Volume, spoken-reply length and the control port are in the agent plugin settings (Capabilities → Plugins → Google Home). ' }),
+          jsx('span', { children: 'Spoken-reply length and the control port are in the agent plugin settings (Capabilities → Plugins → Google Home). Volume and mute are on the Google Home page. ' }),
           jsx('span', {
             children: statusState && statusState.kind === 'ready' && statusState.status.last_error
               ? `Last error: ${statusState.status.last_error}`
@@ -750,10 +1166,115 @@ function SettingsPage() {
   })
 }
 
+/**
+ * The speaker's three quick controls: volume, mute, and whether the composer
+ * shows its picker. The status-bar popover and the page both render this one
+ * component, so the two surfaces can never disagree about a switch.
+ */
+function SpeakerControls({ compact }) {
+  const statusState = useValue($status)
+  const composerHidden = useValue($composerHidden)
+  const [draftVolume, setDraftVolume] = useState(null)
+
+  // An older Desktop has no Switch/range styling to offer; the page hides the
+  // whole card rather than showing dead controls.
+  if (!SDK_POPOVER.toggle) return null
+
+  const status = (statusState && statusState.status) || {}
+  const device = status.device || {}
+  const settings = status.settings || {}
+  const ready = Boolean(statusState && statusState.kind === 'ready' && device.reachable)
+  // Mute is the adapter's silence-all setting: replies, tools, notifications
+  // and cron all stop. Volume stays the device's own level.
+  const muted = Boolean(ready && settings.muted === true)
+  const volume = draftVolume != null
+    ? draftVolume
+    : typeof device.volume === 'number'
+      ? Math.round(device.volume * 100)
+      : 0
+
+  const commitVolume = level => {
+    if (volumeTimer) clearTimeout(volumeTimer)
+    volumeTimer = setTimeout(() => {
+      volumeTimer = null
+      void setSpeakerVolume(level).then(() => setDraftVolume(null))
+    }, 280)
+  }
+
+  const row = (text, control) =>
+    jsxs('div', {
+      className: 'flex items-center justify-between gap-3',
+      children: [
+        jsx('span', { className: 'text-[0.75rem] text-(--ui-text-secondary)', children: text }),
+        control
+      ]
+    })
+
+  return jsxs('div', {
+    className: compact ? 'flex w-full flex-col gap-2.5' : 'flex w-full flex-col gap-3',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2',
+        children: [
+          jsx('span', {
+            className: 'min-w-0 truncate text-[0.75rem] font-medium text-(--ui-text-primary)',
+            children: ready ? speakerName(device) || 'Speaker' : 'Speaker unreachable'
+          }),
+          jsx('span', {
+            className: 'shrink-0 text-[0.6875rem] tabular-nums text-(--ui-text-tertiary)',
+            children: ready ? `${volume}%` : 'off'
+          })
+        ]
+      }),
+      jsx('input', {
+        type: 'range',
+        min: 0,
+        max: 100,
+        step: 1,
+        value: volume,
+        disabled: !ready,
+        'aria-label': 'Speaker volume',
+        className:
+          'h-1 w-full cursor-pointer appearance-none rounded-full bg-(--ui-stroke-tertiary) disabled:cursor-not-allowed disabled:opacity-50',
+        style: { accentColor: 'var(--dt-primary)' },
+        onChange: event => {
+          const level = Number(event && event.target ? event.target.value : 0)
+          setDraftVolume(level)
+          commitVolume(level)
+        }
+      }),
+      jsx('div', { 'aria-hidden': true, className: 'h-px bg-(--ui-stroke-tertiary)' }),
+      row(
+        'Mute speaker',
+        jsx(SDK_POPOVER.toggle, {
+          size: 'xs',
+          checked: muted,
+          disabled: !ready,
+          'aria-label': 'Mute the speaker',
+          onCheckedChange: next => void setSpeakerMuted(Boolean(next))
+        })
+      ),
+      row(
+        'Hide composer picker',
+        jsx(SDK_POPOVER.toggle, {
+          size: 'xs',
+          checked: composerHidden,
+          'aria-label': 'Hide the composer speaker picker',
+          onCheckedChange: next => {
+            hapticTap()
+            setComposerHidden(Boolean(next))
+          }
+        })
+      )
+    ]
+  })
+}
+
 function StatusChip() {
   const statusState = useValue($status)
   const recording = useValue($recording)
   const playback = usePlaybackPolling(1500)
+  const open = useValue($chipOpen)
 
   useEffect(() => {
     void refreshStatus()
@@ -763,9 +1284,11 @@ function StatusChip() {
 
   const status = (statusState && statusState.status) || {}
   const device = status.device || {}
+  const settings = status.settings || {}
   const ready = statusState && statusState.kind === 'ready' && device.reachable
   const speaking = Boolean(playback && playback.speaking)
   const stopping = Boolean(playback && playback.stopping)
+  const muted = Boolean(ready && settings.muted === true)
   const label = speaking
     ? stopping
       ? 'stopping'
@@ -773,38 +1296,73 @@ function StatusChip() {
     : recording
       ? 'listening'
       : ready
-        ? 'speaker'
+        ? muted
+          ? 'muted'
+          : 'speaker'
         : 'speaker off'
 
-  // While audio is audible the chip's job changes: the click that used to open
-  // the page now silences the speaker. That is the whole point of the control —
-  // a long or already-read reply must be interruptible from anywhere.
-  const button = jsxs('button', {
+  // Audio starting while the popover is open must win: the same click that
+  // opened the menu cannot leave a stop control two clicks away.
+  useEffect(() => {
+    if (speaking && $chipOpen.get()) $chipOpen.set(false)
+  }, [speaking])
+
+  // While audio is audible the chip's job changes: the click that opens the
+  // speaker controls becomes the click that silences the speaker. That is the
+  // whole point of the control — a long or already-read reply must be
+  // interruptible from anywhere.
+  const button = jsx('button', {
     type: 'button',
     disabled: stopping,
-    'aria-label': speaking ? 'Stop playback on the speaker' : 'Open the Google Home bridge',
+    'aria-label': speaking ? 'Stop playback on the speaker' : 'Open the speaker controls',
     className: speaking
       ? 'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] text-(--ui-red) hover:text-(--ui-text-primary)'
       : 'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)',
-    onClick: () => {
-      if (speaking) void stopSpeaking()
-      else {
-        hapticTap()
-        host.navigate(ROUTE)
-      }
-    },
+    // The popover trigger owns the click when the shell has one; only the
+    // fallback for an older Desktop navigates to the page.
+    onClick: speaking
+      ? () => void stopSpeaking()
+      : HAS_POPOVER
+        ? undefined
+        : () => {
+            hapticTap()
+            host.navigate(ROUTE)
+          },
     children: [
       jsx('span', {
         'aria-hidden': true,
-        children: speaking ? '⏹' : recording ? '🔴' : ready ? '🔊' : '🔇'
+        children: speaking ? '⏹' : recording ? '🔴' : ready ? (muted ? '🔇' : '🔊') : '🔇'
       }),
       jsx('span', { children: label })
     ]
   })
 
-  return jsx(Tip, {
-    label: speaking ? 'Stop the speaker' : 'Google Home bridge',
-    children: button
+  const tip = speaking ? 'Stop the speaker' : 'Speaker controls'
+  if (speaking || !HAS_POPOVER) {
+    return jsx(Tip, { label: tip, children: button })
+  }
+
+  // No Tip around the popover: Radix's tooltip trigger clones its child, and a
+  // Popover root is a component, so the tip would anchor to nothing. The
+  // button's aria-label carries the same words for screen readers.
+  return jsx(SDK_POPOVER.root, {
+    open: Boolean(open),
+    onOpenChange: next => {
+      if (next) {
+        hapticTap()
+        void refreshStatus()
+      }
+      $chipOpen.set(Boolean(next))
+    },
+    children: [
+      jsx(SDK_POPOVER.trigger, { asChild: true, children: button }),
+      jsx(SDK_POPOVER.content, {
+        side: 'top',
+        align: 'end',
+        className: 'w-72 p-3',
+        children: jsx(SpeakerControls, { compact: true })
+      })
+    ]
   })
 }
 
@@ -901,6 +1459,7 @@ function ComposerSpeaker() {
   const destinations = useValue($speakerDestinations)
   const devices = useValue($speakerDevices)
   const notice = useValue($speakerNotice)
+  const hidden = useValue($composerHidden)
   const [storedId, setStoredId] = useState('')
   // The picker is also the closest thing to a transport control: while audio is
   // audible (including a cron delivery this conversation never chose), show the
@@ -975,6 +1534,11 @@ function ComposerSpeaker() {
       alive = false
     }
   }, [session])
+
+  // Hidden from the chip's popover: the conversation keeps whichever speaker it
+  // already chose, the composer just stops spending a control on it. The
+  // popover is the way back, so this can never strand the choice.
+  if (hidden) return null
 
   const Icon = SDK_ICONS && (on || pendingValue || speaking ? SDK_ICONS.Volume2 : SDK_ICONS.VolumeX)
 
@@ -1128,6 +1692,8 @@ export default {
 
   register(ctx) {
     $status.set({ kind: 'idle' })
+    pluginStorage = ctx.storage || null
+    $composerHidden.set(readComposerHidden())
 
     ctx.register({
       id: 'page',
@@ -1191,6 +1757,24 @@ export default {
     // not be a mystery sound in the next room: say which speaker said it.
     if (typeof ctx.onEvent === 'function') {
       ctx.onEvent('message.complete', announceOtherSession)
+    }
+
+    // The speaker's session is an ordinary Hermes chat (source "googlehome"),
+    // so it lives in Recents under a title taken from its first message. A
+    // badge is the only thing that says "this one is your speaker", and it is
+    // applied only to sessions the routed profile's store actually holds.
+    if (SESSION_ROW_AREAS && SESSION_ROW_AREAS.trailing) {
+      ctx.register({
+        id: 'session-badge',
+        area: SESSION_ROW_AREAS.trailing,
+        // Row slots carry their renderer in ``data``, not at the top level.
+        data: {
+          render: props => jsx(GoogleHomeRowBadge, { sessionId: props && props.sessionId })
+        }
+      })
+    }
+    if (typeof host.listPersistedSessions === 'function') {
+      void loadConversations({ force: true })
     }
 
     if (typeof ctx.registerSettingsPage === 'function') {

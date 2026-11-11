@@ -34,6 +34,8 @@ def _looks_like_cron(message: str) -> bool:
 
 def _spoken_text(message: str, settings: ghconfig.Settings) -> str:
     """What this delivery should sound like, honouring the mute settings."""
+    if getattr(settings, "muted", False):
+        return ""
     text = message or ""
     if _looks_like_cron(text):
         if not settings.speak_cron:

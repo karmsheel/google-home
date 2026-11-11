@@ -90,6 +90,14 @@ class ResolutionOrderTests(unittest.TestCase):
         settings = ghconfig.resolve_settings(self._platform({"speak_cron": "no"}))
         self.assertFalse(settings.speak_cron)
 
+    def test_the_speaker_mute_is_its_own_setting(self):
+        default = ghconfig.resolve_settings(self._platform({}))
+        muted = ghconfig.resolve_settings(self._platform({"muted": "yes"}))
+        self.assertFalse(default.muted)
+        self.assertTrue(default.speak_replies, "mute must not rewrite Speak replies")
+        self.assertTrue(muted.muted)
+        self.assertTrue(muted.speak_replies)
+
     def test_bools_parse_common_truthy_strings(self):
         settings = ghconfig.resolve_settings(self._platform({"speak_replies": "no", "restore_volume": "off"}))
         self.assertFalse(settings.speak_replies)

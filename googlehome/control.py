@@ -10,6 +10,7 @@ find both the port and the token).
 Endpoints
 ---------
 GET  /status     adapter + device state
+GET  /reply      ?token=...  the reply a Desktop turn produced (poll it)
 GET  /playback   what agent audio is playing right now (cheap; no Cast IO)
 GET  /devices    mDNS discovery results
 POST /ask        {"text": "..."}            run a turn as the bound profile
@@ -19,6 +20,7 @@ POST /listen     {"data_url": "data:audio/...;base64,..."}  transcribe + turn
 POST /device     {"device": "ip or name"}   re-target the speaker
 POST /profile    {"profile": "name"}        re-bind the profile
 POST /volume     {"level": 0-100}
+POST /mute       {"muted": true|false}      silence / resume spoken replies
 """
 from __future__ import annotations
 
@@ -35,6 +37,27 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _MAX_BODY = 30 * 1024 * 1024  # 30 MiB: matches the core transcription upload cap
+
+_TRUE_FLAGS = {"1", "true", "yes", "on", "y", "muted"}
+_FALSE_FLAGS = {"0", "false", "no", "off", "n", "unmuted"}
+
+
+def _as_flag(value: Any) -> Optional[bool]:
+    """Read a boolean body field; ``None`` when the value is not a flag.
+
+    JSON booleans are the normal case, but a hand-rolled ``curl`` or a settings
+    file tends to send ``"true"``, so the string forms are accepted too.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in _TRUE_FLAGS:
+        return True
+    if text in _FALSE_FLAGS:
+        return False
+    return None
 
 
 class ControlServer:
@@ -188,6 +211,16 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
 
                 self._reply(200, {"ok": True, **playback.snapshot()})
                 return
+            if path == "/reply":
+                # The speaker is the only output channel; this is how the page
+                # gets the text for a turn it submitted (and any cast failure,
+                # so a silent speaker is never mistaken for a lost turn).
+                from urllib.parse import parse_qs
+
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                token = (parse_qs(query).get("token") or [""])[0]
+                self._reply(200, self.control.adapter.capture_snapshot(token))
+                return
             if path == "/devices":
                 try:
                     from . import discovery
@@ -248,10 +281,21 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                     if not text:
                         self._error(400, "text is required")
                         return
+                    # The page cannot hear the speaker, so every page turn gets
+                    # a token it can poll for the reply text.
+                    token = adapter.begin_capture()
                     submitted = self.control.run(
-                        adapter.submit_utterance(text, origin="desktop")
+                        adapter.submit_utterance(text, origin="desktop", capture=token)
                     )
-                    self._reply(200, {"ok": True, "submitted": bool(submitted), "text": text})
+                    response = {
+                        "ok": True,
+                        "submitted": bool(submitted),
+                        "text": text,
+                        "token": token,
+                    }
+                    if not submitted:
+                        response["error"] = "the gateway did not accept the turn"
+                    self._reply(200, response)
                     return
                 if path == "/speak":
                     text = str(body.get("text") or "").strip()
@@ -273,7 +317,11 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                     except (binascii.Error, ValueError):
                         self._error(400, "data_url is not valid base64")
                         return
-                    result = self.control.run(adapter.submit_audio(audio, mime))
+                    token = adapter.begin_capture()
+                    result = self.control.run(
+                        adapter.submit_audio(audio, mime, capture=token)
+                    )
+                    result.setdefault("token", token)
                     self._reply(200 if result.get("ok") else 400, result)
                     return
                 if path == "/device":
@@ -312,6 +360,14 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                         self._error(400, "level must be an integer 0-100")
                         return
                     result = self.control.run(adapter.set_volume(level))
+                    self._reply(200 if result.get("ok") else 500, result)
+                    return
+                if path == "/mute":
+                    muted = _as_flag(body.get("muted"))
+                    if muted is None:
+                        self._error(400, "muted must be true or false")
+                        return
+                    result = self.control.run(adapter.set_muted(muted))
                     self._reply(200 if result.get("ok") else 500, result)
                     return
                 if path == "/refresh":

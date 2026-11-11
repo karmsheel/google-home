@@ -50,6 +50,22 @@ def setup_cli(parser: Any) -> None:
     speak = actions.add_parser("speak", help="say something on the speaker")
     speak.add_argument("text", nargs="+", help="words to speak")
 
+    notify = actions.add_parser(
+        "notify",
+        help="announce a one-line task outcome (done, blocked, or failed)",
+    )
+    notify.add_argument(
+        "--status", choices=("done", "blocked", "failed"), default="done",
+        help="outcome to announce (default: done)",
+    )
+    notify.add_argument("--task", default="", help="short label for the task")
+    notify.add_argument("--detail", default="", help="optional one-line detail")
+    notify.add_argument(
+        "--speaker", default="",
+        help="speaker name or IP (default: the configured speaker)",
+    )
+    notify.add_argument("--json", action="store_true", help="machine-readable output")
+
     actions.add_parser("status", help="read the running bridge through its control API")
 
     cron = actions.add_parser(
@@ -86,13 +102,17 @@ def run_action(args: Any) -> int:
         "check": _check,
         "devices": _devices,
         "speak": _speak_action,
+        "notify": _notify_action,
         "status": _status,
         "cron": _cron,
         "firewall": _firewall,
     }
     handler = handlers.get(action)
     if handler is None:
-        print(f"unknown action {action!r}; try: check, devices, speak, status, cron, firewall")
+        print(
+            f"unknown action {action!r}; try: check, devices, speak, notify, "
+            "status, cron, firewall"
+        )
         return 2
     return int(handler(args) or 0)
 
@@ -266,6 +286,37 @@ def _devices(args: Any) -> int:
 def _speak_action(args: Any) -> int:
     result = _speak(" ".join(args.text))
     print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("ok") else 1
+
+
+def _notify_action(args: Any) -> int:
+    from . import notify
+
+    try:
+        result = notify.announce(
+            args.status,
+            task=args.task,
+            detail=args.detail,
+            speaker=args.speaker,
+            settings=_settings(),
+        )
+    except notify.SpeakerLookupError as exc:
+        result = {"ok": False, "error": str(exc), "available_speakers": exc.available}
+    except ValueError as exc:
+        result = {"ok": False, "error": str(exc)}
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, default=str))
+    elif result.get("ok"):
+        print(result.get("spoken") or "")
+        print(
+            f"  spoken on {result.get('device') or result.get('address')} "
+            f"({result.get('via') or 'cast'})"
+        )
+    else:
+        print(f"Notification failed: {result.get('error') or 'unknown error'}")
+        for name in result.get("available_speakers") or []:
+            print(f"  available: {name}")
     return 0 if result.get("ok") else 1
 
 

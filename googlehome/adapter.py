@@ -21,6 +21,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
+import tempfile
 import threading
 import time
 import uuid
@@ -76,6 +78,33 @@ _AUDIO_EXTENSIONS = {
     "audio/aac": ".aac",
 }
 
+#: How long a Desktop turn's reply stays retrievable, and how many entries a
+#: misbehaving page can leave behind.
+_CAPTURE_TTL_SECONDS = 15 * 60
+_CAPTURE_LIMIT = 32
+#: The resolved profile is re-read at most this often by ``status()``.
+_ROUTE_CACHE_SECONDS = 15.0
+
+#: The reasoning block Hermes prepends for display when ``display.show_reasoning``
+#: is on: ``💭 **Reasoning:**`` then a fenced block, then the answer. The label is
+#: localized, so match the shape (emoji + fence), not the words.
+_REASONING_BLOCK = re.compile(
+    r"\A\s*💭[^\n]*\n\s*```[^\n]*\n.*?\n\s*```\s*",
+    re.DOTALL,
+)
+
+
+def strip_rendered_reasoning(text: str) -> str:
+    """Remove a leading reasoning block from a reply.
+
+    Reasoning is screen furniture: it must never be spoken by the speaker, and
+    the Desktop page should show the answer the room heard. The gateway only
+    prepends it when ``show_reasoning`` is on, so this is a no-op otherwise —
+    belt and braces for a platform whose rails are already set to hide it.
+    """
+    cleaned = _REASONING_BLOCK.sub("", text or "", count=1)
+    return cleaned if cleaned.strip() else ""
+
 
 def check_requirements() -> bool:
     """Passive dependency probe: the plugin is stdlib-only, so always ready."""
@@ -104,6 +133,20 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         self._client: Optional[castdevice.CastClient] = None
         self._speak_lock = threading.Lock()
         self._device: dict[str, Any] = {}
+        # Desktop turn replies: ``POST /ask`` / ``POST /listen`` hand back a
+        # token, and the page polls ``GET /reply`` for the text it could not
+        # otherwise see (the speaker is the only output channel). Bounded by
+        # age and count so a page that vanished cannot leak entries.
+        self._captures: dict[str, dict[str, Any]] = {}
+        # One adapter serves one speaker (one chat), so the newest capture is the
+        # only one a send can belong to; older tokens stay pollable until they
+        # expire rather than being clobbered.
+        self._active_capture = ""
+        self._capture_lock = threading.Lock()
+        self._capturing_paused = 0
+        # ``profile_routes`` in gateway config outranks the configured profile;
+        # cache the resolved answer so a 3s status poll does not re-resolve it.
+        self._route_cache: tuple[str, float] = ("", 0.0)
         self._started = False
         self.started_at = 0.0
         self.last_error = ""
@@ -470,27 +513,44 @@ class GoogleHomeAdapter(BasePlatformAdapter):
     ) -> SendResult:
         # Cron passes ``job_id`` in the metadata; interactive replies do not.
         is_cron = bool((metadata or {}).get("job_id"))
+        # Reasoning is screen furniture: never spoken, never shown as the answer.
+        content = strip_rendered_reasoning(content)
+        if self.settings.muted:
+            # Muted, not lost: the page still gets what the room missed. This is
+            # checked before the cron branch so the popover silences everything.
+            self._record_capture(chat_id, content)
+            return SendResult(success=True, message_id=f"gh-muted-{uuid.uuid4().hex[:8]}")
         if is_cron:
             if not self.settings.speak_cron:
                 return SendResult(success=True, message_id=f"gh-cron-muted-{uuid.uuid4().hex[:8]}")
         elif not self.settings.speak_replies:
+            # Muted, not lost: the Desktop page still gets what the room missed.
+            self._record_capture(chat_id, content)
             return SendResult(success=True, message_id=f"gh-muted-{uuid.uuid4().hex[:8]}")
 
         text = self._spoken_text(content, cron=is_cron)
         if not text:
+            self._record_capture(chat_id, content)
             return SendResult(success=True, message_id=f"gh-empty-{uuid.uuid4().hex[:8]}")
         if self.settings.proxy:
-            return await self._proxy_send(text)
+            result = await self._proxy_send(text)
+            if result.success:
+                self._record_capture(chat_id, content)
+            else:
+                self._record_capture(chat_id, error=result.error or "the primary bridge could not speak")
+            return result
 
         try:
             files = await asyncio.to_thread(self._synthesize, text)
         except speech.TtsUnavailable as exc:
             self.last_error = str(exc)
             logger.warning("[%s] %s", PLATFORM_NAME, exc)
+            self._record_capture(chat_id, error=str(exc), keep_active=True)
             return SendResult(success=False, error=str(exc), error_kind="tts_unavailable")
         except RuntimeError as exc:
             self.last_error = str(exc)
             logger.warning("[%s] %s", PLATFORM_NAME, exc)
+            self._record_capture(chat_id, error=str(exc), keep_active=True)
             return SendResult(success=False, error=str(exc), retryable=True)
 
         self.last_spoken = text
@@ -499,9 +559,11 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         except castdevice.CastError as exc:
             self.last_error = str(exc)
             logger.warning("[%s] could not play reply: %s", PLATFORM_NAME, exc)
+            self._record_capture(chat_id, content, error=str(exc))
             return SendResult(success=False, error=str(exc), retryable=True)
 
         self.last_error = ""
+        self._record_capture(chat_id, content)
         return SendResult(success=True, message_id=f"gh-{uuid.uuid4().hex[:10]}")
 
     async def _proxy_send(self, text: str) -> SendResult:
@@ -519,13 +581,65 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         self.last_spoken = text
         return SendResult(success=True, message_id=f"gh-proxy-{uuid.uuid4().hex[:8]}")
 
+    def _record_capture(
+        self,
+        chat_id: str,
+        reply: Optional[str] = None,
+        *,
+        error: str = "",
+        keep_active: bool = False,
+    ) -> None:
+        """Hand this send to the Desktop's reply poll, when one is waiting.
+
+        A failure keeps the token alive so the gateway's plain-text retry can
+        replace the error with the real reply. Tool speech (``speak_text``) is
+        paused out: it is not the turn's answer.
+        """
+        if getattr(self, "_capturing_paused", 0):
+            return
+        if str(chat_id) != self.settings.chat_id:
+            return
+        if reply is None and not error:
+            return
+        self._finish_capture(
+            chat_id,
+            reply=reply,
+            error=error,
+            success=not error,
+            keep_active=keep_active,
+        )
+
+    @staticmethod
+    def _is_auto_tts_audio(audio_path: str) -> bool:
+        """True for a clip Hermes's own auto-TTS prepared for a reply.
+
+        ``voice.auto_tts`` / ``/voice on`` make the gateway synthesize the final
+        reply and hand it to ``send_voice`` — but this adapter's ``send`` already
+        speaks that same reply. Playing both made every turn answer twice, and
+        the first (auto) clip closed the Desktop's reply capture before the real
+        text arrived. The auto-TTS files live in ``<tmp>/hermes_voice``.
+        """
+        try:
+            path = Path(str(audio_path)).resolve()
+            auto_dir = (Path(tempfile.gettempdir()) / "hermes_voice").resolve()
+            return path.parent == auto_dir
+        except OSError:
+            return False
+
     async def play_tts(self, chat_id: str, audio_path: str, **kwargs: Any) -> SendResult:
         """Hermes already synthesized audio for this turn: just play it."""
+        if self._is_auto_tts_audio(audio_path):
+            # ``send`` is the speaker's voice; the auto clip is the duplicate.
+            return SendResult(success=True, message_id=f"gh-auto-tts-{uuid.uuid4().hex[:8]}")
         try:
             await self._play([str(audio_path)])
         except castdevice.CastError as exc:
             self.last_error = str(exc)
+            self._record_capture(chat_id, error=str(exc))
             return SendResult(success=False, error=str(exc), retryable=True)
+        # The audio exists but Hermes never handed this adapter the text: end the
+        # capture so the page stops waiting and says it played.
+        self._record_capture(chat_id, "")
         return SendResult(success=True, message_id=f"gh-{uuid.uuid4().hex[:10]}")
 
     async def send_voice(
@@ -553,14 +667,108 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             "chat_id": chat_id,
         }
 
+    # ── Desktop turn replies ─────────────────────────────────────────────────
+    # The page can hear nothing: the speaker is the only output. A turn's reply
+    # is captured here, keyed by an opaque token, so ``GET /reply`` can hand the
+    # Desktop the text it would otherwise never see. Capture is best effort —
+    # Hermes's reply always wins the normal path (its own TTS run through
+    # ``send``), and a turn that never sends anything simply expires.
+    def begin_capture(self) -> str:
+        """Start recording the reply of the next turn for the Desktop page."""
+        token = uuid.uuid4().hex[:12]
+        now = time.time()
+        with self._capture_lock:
+            self._sweep_captures(now)
+            self._captures[token] = {
+                "token": token,
+                "chat_id": self.settings.chat_id,
+                "started": now,
+                "done": False,
+                "reply": "",
+                "error": "",
+            }
+            self._active_capture = token
+        return token
+
+    def capture_snapshot(self, token: str) -> dict[str, Any]:
+        """What the Desktop should show for ``token`` right now."""
+        with self._capture_lock:
+            self._sweep_captures()
+            entry = self._captures.get(str(token or ""))
+            if entry is None:
+                return {"ok": False, "error": "this turn expired (or was never started)"}
+            return {
+                "ok": True,
+                "token": entry["token"],
+                "done": bool(entry["done"]),
+                "reply": entry["reply"],
+                "error": entry["error"],
+                "elapsed_seconds": round(time.time() - entry["started"], 1),
+            }
+
+    def _finish_capture(
+        self,
+        chat_id: str,
+        *,
+        reply: Optional[str] = None,
+        error: str = "",
+        success: bool = False,
+        keep_active: bool = False,
+    ) -> None:
+        with self._capture_lock:
+            token = self._active_capture
+            entry = self._captures.get(token) if token else None
+            if entry is None or str(entry["chat_id"]) != str(chat_id):
+                # A send for another chat is not this page's turn.
+                return
+            if reply is not None:
+                entry["reply"] = str(reply)
+            if success:
+                entry["error"] = ""
+            elif error:
+                entry["error"] = str(error)
+            entry["done"] = True
+            # A failed send keeps the token active: the gateway retries once with
+            # a plain-text fallback, and that success must replace the error.
+            if not keep_active:
+                self._active_capture = ""
+
+    def _sweep_captures(self, now: float = 0.0) -> None:
+        """Drop stale and surplus entries. Caller holds ``_capture_lock``."""
+        now = now or time.time()
+        for token, entry in list(self._captures.items()):
+            if now - entry["started"] > _CAPTURE_TTL_SECONDS:
+                self._captures.pop(token, None)
+                if self._active_capture == token:
+                    self._active_capture = ""
+        while len(self._captures) > _CAPTURE_LIMIT:
+            oldest = min(self._captures.values(), key=lambda item: item["started"])
+            self._captures.pop(oldest["token"], None)
+            if self._active_capture == oldest["token"]:
+                self._active_capture = ""
+
     # ── inbound ──────────────────────────────────────────────────────────────
-    async def submit_utterance(self, text: str, *, origin: str = "text", audio_path: str = "") -> bool:
+    async def submit_utterance(
+        self,
+        text: str,
+        *,
+        origin: str = "text",
+        audio_path: str = "",
+        capture: str = "",
+    ) -> bool:
         """Treat ``text`` as something the user just said to the speaker."""
         text = (text or "").strip()
         if not text:
+            if capture:
+                self._finish_capture(self.settings.chat_id, error="the message was empty")
             return False
         if not self._message_handler and self._loop is None:
             logger.warning("[%s] cannot accept input before connect()", PLATFORM_NAME)
+            if capture:
+                self._finish_capture(
+                    self.settings.chat_id,
+                    error="the bridge is not connected to the gateway yet",
+                )
             return False
 
         self.last_transcript = text
@@ -586,13 +794,31 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             message_id=f"gh-{uuid.uuid4().hex[:10]}",
         )
         logger.info("[%s] turn from %s (profile=%s): %s",
-                    PLATFORM_NAME, origin, self.settings.profile or "default", text[:120])
-        await self.handle_message(event)
+                    PLATFORM_NAME, origin, getattr(source, "profile", "") or "default",
+                    text[:120])
+        try:
+            await self.handle_message(event)
+        except Exception as exc:  # noqa: BLE001 - the page needs the reason
+            if capture:
+                self._finish_capture(
+                    self.settings.chat_id,
+                    error=f"the turn could not start: {exc}",
+                )
+            raise
+        # ``handle_message`` records whether the gateway took the event; a False
+        # here means every inbound is discarded and no reply will ever arrive.
+        if capture and getattr(event, "_gateway_accepted", None) is False:
+            self._finish_capture(
+                self.settings.chat_id,
+                error="the Hermes gateway did not accept the turn (no message handler)",
+            )
         return True
 
-    async def submit_audio(self, data: bytes, mime: str = "audio/webm") -> dict[str, Any]:
+    async def submit_audio(self, data: bytes, mime: str = "audio/webm", capture: str = "") -> dict[str, Any]:
         """Transcribe a recording with Hermes's STT stack, then run the turn."""
         if not data:
+            if capture:
+                self._finish_capture(self.settings.chat_id, error="empty recording")
             return {"ok": False, "error": "empty recording"}
         normalized = (mime or "").split(";", 1)[0].strip().lower()
         extension = _AUDIO_EXTENSIONS.get(normalized, ".webm")
@@ -604,18 +830,28 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         try:
             result = await asyncio.to_thread(self._transcribe_blocking, str(path))
         except Exception as exc:  # noqa: BLE001 - STT surfaces many errors
+            if capture:
+                self._finish_capture(self.settings.chat_id, error=f"transcription failed: {exc}")
             return {"ok": False, "error": f"transcription failed: {exc}"}
 
         transcript = str(result.get("transcript") or "").strip()
         if not result.get("success"):
             error = str(result.get("error") or "transcription failed")
             if "empty transcript" in error.lower():
+                if capture:
+                    self._finish_capture(self.settings.chat_id, error="no speech detected")
                 return {"ok": True, "transcript": "", "submitted": False}
+            if capture:
+                self._finish_capture(self.settings.chat_id, error=error)
             return {"ok": False, "error": error}
         if not transcript:
+            if capture:
+                self._finish_capture(self.settings.chat_id, error="no speech detected")
             return {"ok": True, "transcript": "", "submitted": False}
 
-        submitted = await self.submit_utterance(transcript, origin="mic", audio_path=str(path))
+        submitted = await self.submit_utterance(
+            transcript, origin="mic", audio_path=str(path), capture=capture
+        )
         return {
             "ok": True,
             "transcript": transcript,
@@ -630,8 +866,39 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         return transcribe_recording(path)
 
     # ── status / control helpers ─────────────────────────────────────────────
+    def effective_profile(self, *, refresh: bool = False) -> str:
+        """Who actually answers, after ``gateway.profile_routes`` had its say.
+
+        The Desktop's profile selector writes the adapter's own setting, but the
+        gateway stamps ``SessionSource.profile`` from its routes (see
+        ``build_source``). Reporting only the configured value made the page
+        claim "default" while a routed profile answered. Cache the resolved
+        value so the 3s status poll stays cheap.
+        """
+        cached, at = self._route_cache
+        now = time.time()
+        if not refresh and at and now - at < _ROUTE_CACHE_SECONDS:
+            return cached
+        fallback = self.settings.profile or ""
+        try:
+            source = self.build_source(
+                chat_id=self.settings.chat_id,
+                chat_name=str(self._device.get("name") or "Google Home"),
+                chat_type="dm",
+                user_id="speaker",
+                user_name="Speaker",
+            )
+            routed = str(getattr(source, "profile", "") or "")
+        except Exception:  # noqa: BLE001 - status must never fail on routing
+            logger.debug("[%s] could not resolve the routed profile", PLATFORM_NAME, exc_info=True)
+            routed = fallback
+        self._route_cache = (routed, now)
+        return routed or fallback
+
     async def status(self) -> dict[str, Any]:
         playing = playback.snapshot()
+        routed = self.effective_profile()
+        configured = self.settings.profile or ""
         payload: dict[str, Any] = {
             "ok": True,
             "platform": PLATFORM_NAME,
@@ -644,7 +911,11 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             # (a conversation pointed at its own speaker).
             "speaking": bool(self.speaking or playing["speaking"]),
             "playback": playing,
-            "profile": self.settings.profile or "",
+            "profile": configured,
+            # ``routed_profile`` is the profile the gateway will run the turn
+            # under; it differs from ``profile`` when profile_routes redirects.
+            "routed_profile": routed,
+            "profile_overridden": bool(routed and routed != configured),
             "chat_id": self.settings.chat_id,
             "device": {
                 "name": self._device.get("name", ""),
@@ -665,6 +936,7 @@ class GoogleHomeAdapter(BasePlatformAdapter):
                 "device": self.settings.device,
                 "profile": self.settings.profile,
                 "volume": self.settings.volume,
+                "muted": self.settings.muted,
                 "speak_replies": self.settings.speak_replies,
                 "speak_cron": self.settings.speak_cron,
                 "proxy": self.settings.proxy,
@@ -700,7 +972,13 @@ class GoogleHomeAdapter(BasePlatformAdapter):
 
     async def speak_text(self, text: str) -> dict[str, Any]:
         """Speak arbitrary text without running an agent turn."""
-        result = await self.send(self.settings.chat_id, text)
+        # This is not a turn's reply: keep it out of a waiting capture, or the
+        # page would show whatever was spoken on command as the answer.
+        self._capturing_paused += 1
+        try:
+            result = await self.send(self.settings.chat_id, text)
+        finally:
+            self._capturing_paused -= 1
         return {"ok": result.success, "error": result.error}
 
     async def set_volume(self, level: int) -> dict[str, Any]:
@@ -716,6 +994,22 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         with self._speak_lock:
             self._client_blocking().set_volume(level / 100.0)
 
+    async def set_muted(self, muted: bool) -> dict[str, Any]:
+        """Mute or unmute the speaker completely.
+
+        This is the status-bar popover's switch, and it gates every speaking
+        path — platform replies, tools, notifications, ambient speech and cron —
+        so muting never leaves one door open. It persists through the plugin
+        settings, so a restart does not quietly unmute the room, and it cuts
+        whatever is audible right now.
+        """
+        muted = bool(muted)
+        self.settings.muted = muted
+        self._persist("muted", muted)
+        if muted:
+            playback.stop()
+        return {"ok": True, "muted": muted}
+
     async def set_device(self, spec: str) -> dict[str, Any]:
         self.settings.device = (spec or "").strip()
         self._drop_client()
@@ -728,11 +1022,14 @@ class GoogleHomeAdapter(BasePlatformAdapter):
     async def set_profile(self, name: str) -> dict[str, Any]:
         self.settings.profile = (name or "").strip()
         self._persist("profile", self.settings.profile)
+        # The select may not be what answers: re-resolve the route before the
+        # page repaints, so the chip never claims a profile the gateway ignores.
+        self.effective_profile(refresh=True)
         self._write_control_file()
         return await self.status()
 
     @staticmethod
-    def _persist(key: str, value: str) -> None:
+    def _persist(key: str, value: Any) -> None:
         """Write a UI choice through the plugin settings writer (best effort)."""
         ctx = ghconfig.plugin_ctx()
         if ctx is None:

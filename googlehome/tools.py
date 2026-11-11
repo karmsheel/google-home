@@ -11,7 +11,7 @@ import logging
 import threading
 from typing import Any, Optional
 
-from . import castdevice, discovery, playback, speech
+from . import castdevice, discovery, notify, playback, speech
 from . import config as ghconfig
 from .adapter import active_adapter
 from .audioserver import MediaServer, content_type_for
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 TOOLSET = "googlehome"
 _EMOJI = "🔊"
+_NOTIFY_EMOJI = "🔔"
 
 
 # ── shared helpers ───────────────────────────────────────────────────────────
@@ -112,6 +113,10 @@ def _size(path: str) -> float:
 
 def _speak(text: str, *, settings: Optional[ghconfig.Settings] = None) -> dict[str, Any]:
     settings = settings or _settings()
+    if getattr(settings, "muted", False):
+        # Muted in the Desktop popover: a tool call must not be the door that
+        # lets the room hear something. Report success so the turn is not retried.
+        return {"ok": True, "muted": True, "skipped": True}
     text = (text or "").strip()
     if not text:
         return {"ok": False, "error": "text is required"}
@@ -140,12 +145,20 @@ def _speak(text: str, *, settings: Optional[ghconfig.Settings] = None) -> dict[s
     return result
 
 
-def speak_to(text: str, settings: ghconfig.Settings) -> dict[str, Any]:
+def speak_to(
+    text: str,
+    settings: ghconfig.Settings,
+    *,
+    source: str = "ambient",
+) -> dict[str, Any]:
     """Synthesize and cast to ``settings.device``, bypassing the adapter.
 
     Used when a conversation picked its own speaker in the composer: that
-    device may be one the adapter is not bound to.
+    device may be one the adapter is not bound to. ``source`` labels the clip
+    in the playback registry (``ambient``, ``notify``).
     """
+    if getattr(settings, "muted", False):
+        return {"ok": True, "muted": True, "skipped": True}
     spoken = speech.flatten_for_speech(text, settings.max_chars)
     if not spoken:
         return {"ok": True, "skipped": True}
@@ -160,7 +173,7 @@ def speak_to(text: str, settings: ghconfig.Settings) -> dict[str, Any]:
         return {"ok": False, "error": str(exc), "kind": "tts_unavailable"}
     except RuntimeError as exc:
         return {"ok": False, "error": str(exc), "kind": "tts_failed"}
-    return _direct_play(files, settings, source="ambient")
+    return _direct_play(files, settings, source=source)
 
 
 def _status(settings: ghconfig.Settings) -> dict[str, Any]:
@@ -193,6 +206,39 @@ def _status(settings: ghconfig.Settings) -> dict[str, Any]:
 # ── handlers ─────────────────────────────────────────────────────────────────
 def _handle_speak(args: dict[str, Any], **_kwargs: Any) -> str:
     return json.dumps(_speak(str(args.get("text") or "")))
+
+
+def _handle_notify(args: dict[str, Any], **kwargs: Any) -> str:
+    """Speak one task line, defaulting to this conversation's own speaker."""
+    speaker = str(args.get("speaker") or "").strip()
+    if not speaker:
+        # A chat pointed at a speaker in the composer should notify *that*
+        # speaker even when the agent does not repeat its name.
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if session_id:
+            from . import ambient
+
+            entry = ambient.destination_for(session_id)
+            if entry and entry.get("mode") == "speaker":
+                speaker = str(entry.get("device") or "").strip()
+    try:
+        result = notify.announce(
+            str(args.get("status") or ""),
+            task=str(args.get("task") or ""),
+            detail=str(args.get("detail") or ""),
+            speaker=speaker,
+            settings=_settings(),
+        )
+    except notify.SpeakerLookupError as exc:
+        result = {
+            "ok": False,
+            "error": str(exc),
+            "kind": "speaker_not_found",
+            "available_speakers": exc.available,
+        }
+    except ValueError as exc:
+        result = {"ok": False, "error": str(exc), "kind": "bad_status"}
+    return json.dumps(result)
 
 
 def _handle_status(args: dict[str, Any], **_kwargs: Any) -> str:
@@ -267,6 +313,56 @@ _SPEAK_SCHEMA = {
     },
 }
 
+_NOTIFY_SCHEMA = {
+    "name": "googlehome_notify",
+    "description": (
+        "Announce a task's outcome on a Google Home / Nest speaker as ONE short "
+        "line, for example 'Task complete: the report. Waiting for your review.' "
+        "Use it only when the user asked to be notified on a speaker. Call it "
+        "once, as the last tool before your final answer, when the task is done, "
+        "blocked, or has failed. Do not pass the chat reply or a summary of it: "
+        "pass a short task label and, optionally, one short detail. This speaks "
+        "immediately and returns the exact line."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["done", "blocked", "failed"],
+                "description": (
+                    "done = finished and ready for review; blocked = needs the "
+                    "user's input; failed = could not complete."
+                ),
+            },
+            "task": {
+                "type": "string",
+                "description": (
+                    "Short label for what was being done, e.g. 'the nightly build' "
+                    "or 'reviewing PR 42'. Keep it under 70 characters; omit for a "
+                    "generic 'Task complete.'"
+                ),
+            },
+            "detail": {
+                "type": "string",
+                "description": (
+                    "Optional one-line detail, e.g. '3 tests failed' or 'waiting on "
+                    "API credentials'. Under 100 characters."
+                ),
+            },
+            "speaker": {
+                "type": "string",
+                "description": (
+                    "Speaker the user named, e.g. 'living room speaker', or an IP. "
+                    "Omit to use this conversation's chosen speaker, then the "
+                    "configured speaker."
+                ),
+            },
+        },
+        "required": ["status"],
+    },
+}
+
 _STATUS_SCHEMA = {
     "name": "googlehome_status",
     "description": (
@@ -313,6 +409,14 @@ def register_tools(ctx: Any) -> None:
         handler=_handle_speak,
         description="Speak text through the Google Home speaker.",
         emoji=_EMOJI,
+    )
+    ctx.register_tool(
+        name=_NOTIFY_SCHEMA["name"],
+        toolset=TOOLSET,
+        schema=_NOTIFY_SCHEMA,
+        handler=_handle_notify,
+        description="Announce a one-line task outcome on the speaker.",
+        emoji=_NOTIFY_EMOJI,
     )
     ctx.register_tool(
         name=_STATUS_SCHEMA["name"],

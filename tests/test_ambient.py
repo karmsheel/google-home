@@ -115,6 +115,14 @@ class HookTests(unittest.TestCase):
             ambient.on_post_llm_call(assistant_response="hello", session_id="s1", turn_id="t1", platform="desktop")
         speak.assert_not_called()
 
+    def test_a_notification_replaces_the_full_reply(self):
+        """The room hears the one-line outcome, not the whole answer again."""
+        ambient.set_destination("s1", "speaker", device="192.168.1.145")
+        ambient.on_post_tool_call(tool_name="googlehome_notify", session_id="s1", turn_id="t2")
+        with mock.patch.object(ambient, "_speak_in_background") as speak:
+            ambient.on_post_llm_call(assistant_response="the whole long answer", session_id="s1", turn_id="t2", platform="desktop")
+        speak.assert_not_called()
+
     def test_empty_reply_is_silent(self):
         ambient.set_destination("s1", "speaker", device="192.168.1.145")
         with mock.patch.object(ambient, "_speak_in_background") as speak:

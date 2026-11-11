@@ -7,7 +7,7 @@ out loud.
 
 - **Agent plugin** (`googlehome/`) — a `kind: platform` gateway adapter. Replies are
   synthesized with Hermes's own TTS stack and cast to the device over the Cast v2
-  protocol. Zero third-party dependencies. Adds four tools.
+  protocol. Zero third-party dependencies. Adds five tools.
 - **Desktop extension** (`googlehome/desktop/plugin.js`) — a page, a status-bar
   chip, palette commands and a settings page, with the push-to-talk microphone.
 
@@ -166,6 +166,8 @@ missing rule: the cast starts, then the speaker goes quiet and
 hermes googlehome check           # can this machine make the speaker talk?
 hermes googlehome devices         # what Cast devices are on this network?
 hermes googlehome speak "dinner is ready"
+hermes googlehome notify --status done --task "the nightly build"
+hermes googlehome notify --status blocked --task "the deploy" --detail "API key"
 hermes googlehome status          # the running bridge, as JSON
 hermes googlehome cron on         # also speak every cron job's output
 hermes googlehome cron status     # which jobs target the speaker
@@ -175,7 +177,22 @@ hermes googlehome firewall        # open the media port (UAC prompt)
 
 - **Desktop** → sidebar **Google Home** (or ⌘K → "Talk to the speaker").
   Press the mic, speak, press again. The transcript appears, the turn runs, the
-  speaker answers.
+  speaker answers — and the same reply is shown under **Hermes said**, with a
+  **Open the conversation** button, so the page is no longer a send-only surface.
+  If the speaker could not be reached, the page says so instead of staying silent.
+- **The conversation is a real session.** Both the mic and the text box run a
+  normal Hermes turn as the profile that answers (see [Which profile
+  answers](#which-profile-answers)). It stays in that profile's session store
+  under the `googlehome` source and keeps one stable key per speaker, so it can
+  be opened later like any other chat. The page lists those conversations and
+  marks the session row in the sidebar with a **Google Home** badge.
+- **Reasoning is never spoken.** `display.show_reasoning` makes the gateway
+  prepend a `💭 **Reasoning:**` block to the reply for on-screen surfaces; a
+  speaker should only hear the answer. The bridge strips a leading reasoning
+  block before speaking or showing it, and this install also sets
+  `display.platforms.googlehome.show_reasoning: false` so it is not produced
+  for this platform in the first place:
+  `hermes config set display.platforms.googlehome.show_reasoning false`.
 - **While audio is playing**, the composer's Speaker control shows
   `<speaker> · speaking` and a stop button; its menu also gets a **Stop
   speaking** row. This is deliberately transient: a cron delivery belongs to
@@ -188,14 +205,38 @@ hermes googlehome firewall        # open the media port (UAC prompt)
   any queued chunks) — useful when the reply is long, was already read in the
   chat, or is simply the wrong moment. It also stops turn-end speech from a
   conversation whose Speaker picker is on.
+- **The status-bar speaker chip is a control, not a link.** Clicking
+  **🔊 speaker** at the bottom-right opens a small popover instead of taking you
+  to the Google Home page:
+  - **Volume** — the speaker's own level, committed as you move the slider.
+  - **Mute speaker** — silences every spoken output: replies, tool speech,
+    notifications and cron. The text still reaches the chat and the page; the
+    room just goes quiet. It stays muted across a gateway restart until you
+    flip it back.
+  - **Hide composer picker** — removes the **Speaker** control from every
+    composer. The popover is the way back, so the choice is never stranded.
+  While audio is playing the chip is **⏹ stop** as before, and the page stays
+  reachable from the sidebar (Google Home) and ⌘K → "Open Google Home bridge".
+- **The same controls are on the page.** The bottom of the Google Home page is
+  one two-column settings section: the **Speaker** and **Hermes profile** rows
+  in their own box on the left, and the **Speaker controls** box — volume,
+  **Mute speaker**, **Hide composer picker** — on the right. Both boxes share
+  the same elevated surface and stretch to the same height, so the section reads
+  as one block. The routing rows are compact: each picker sits on
+  its option's title line, and the one-line explanations moved into hover tips,
+  so the left box does not tower over the controls. The page column is padded
+  (`px-12`) and its width is `min(50% + 24rem, 88rem)`, which halves the side
+  gutters of a 48rem column at every window size.
 - **Composer control**: every conversation gets a **Speaker** picker beside the
   model selector — point that chat at a speaker, or Off. See
-  [One conversation, one speaker](#one-conversation-one-speaker).
+  [One conversation, one speaker](#one-conversation-one-speaker). Hide it from
+  the status-bar chip's popover if the composer is tight.
 - **From the agent**: the `googlehome` toolset —
 
   | Tool | Purpose |
   |---|---|
   | `googlehome_speak` | say something on the speaker |
+  | `googlehome_notify` | announce a one-line task outcome (done/blocked/failed) |
   | `googlehome_status` | device, reachability, volume, bound profile, last error |
   | `googlehome_volume` | set device volume 0–100 |
   | `googlehome_devices` | list Cast devices on the LAN |
@@ -205,13 +246,15 @@ hermes googlehome firewall        # open the media port (UAC prompt)
   ```
   GET  /status      GET  /devices      GET  /info
   GET  /playback                           # what agent audio is audible now
-  POST /ask         {"text": "…"}
+  GET  /reply?token=<turn>                 # the reply a page turn produced
+  POST /ask         {"text": "…"}          # -> {"token": "…", "submitted": true}
   POST /speak       {"text": "…"}          # speak without an agent turn
   POST /stop                               # silence the current clip
   POST /listen      {"data_url": "data:audio/webm;base64,…"}
   POST /device      {"device": "192.168.1.42"}
   POST /profile     {"profile": "coder"}
   POST /volume      {"level": 0-100}
+  POST /mute        {"muted": true|false}   # silence / resume spoken replies
   POST /refresh
   GET  /destination?session=<id>
   POST /destination {"session": "…", "mode": "off|speaker", "device": "…", "name": "…"}
@@ -221,6 +264,27 @@ hermes googlehome firewall        # open the media port (UAC prompt)
   never touches the Cast socket, so the Desktop can poll it while a long reply
   plays. `POST /stop` sends Cast `STOP` for the clip's `mediaSessionId` and
   returns `{"ok": true, "stopped": 1, "playback": {"speaking": false, …}}`.
+
+  `POST /ask` and `POST /listen` return a **turn token**. The page polls
+  `GET /reply?token=…` until `done`, then shows `reply` (or `error`: no speech
+  backend, a failed cast, a refused turn). The token expires after 15 minutes
+  and never outlives the gateway. This is how the page shows the answer at all —
+  the speaker is the only audio output, and Hermes's own TTS text is not
+  otherwise visible.
+
+### Which profile answers
+
+`/status` reports both `profile` (the plugin setting behind the page's selector)
+and `routed_profile` (what the gateway will actually use). When
+`gateway.profile_routes` names a profile for `googlehome`, that route wins inside
+`build_source`, and `profile_overridden` is true. The page then says
+`profile: <routed> · routed` and explains that the selector cannot change who
+answers — a choice it silently ignored was how a conversation looked lost.
+
+The session lives in the **routed** profile's store. The Desktop's sidebar scopes
+every section to the profile you are viewing, so to see the chat directly, switch
+to that profile (or **All agents**). The Google Home page lists it regardless of
+the sidebar's scope.
 
 ### One conversation, one speaker
 
@@ -244,6 +308,47 @@ so it never doubles the platform adapter; a turn that already called
 While one of those replies is playing, the same stop control described above
 works from any conversation: the chip reads `⏹ stop`, and clicking it silences
 the speaker even though the reply belongs to another chat.
+
+### Task notifications
+
+For a long task, reading the final answer aloud is usually the wrong thing: you
+want to know that it is finished, not to hear the report a second time. Tell the
+agent where to notify you, in your own words:
+
+> Review PR 42 and, when you are done, tell me on the living room speaker.
+
+The agent calls `googlehome_notify` once, with a short outcome and label. The
+speaker hears one line, while the full answer stays in the chat:
+
+| Status | What the speaker says |
+|---|---|
+| `done` | **Task complete: the report. Waiting for your review.** |
+| `blocked` | **Task blocked: the deploy. Needs your input.** |
+| `failed` | **Task failed: the build. Needs your attention.** |
+
+A short `detail` can be added (`"3 tests failed"`); it stays on the same line.
+Nothing else about the reply is read out. If the conversation's own **Speaker**
+picker is on, the notification replaces the full-reply readout for that turn, so
+the room never hears both.
+
+Which speaker it uses, in order:
+
+1. the name or IP the agent passed — `"living room speaker"` matches the
+   friendly name from the Google Home app, ignoring case and the word "speaker";
+2. the speaker this conversation picked in the composer (if any);
+3. the plugin's configured `device`.
+
+A name that matches nothing, or two speakers equally well, is an error that
+lists the discoverable names — it never falls back to the first speaker on the
+network. That matters at home: announcing the wrong room is worse than silence.
+
+Try the same line without an agent:
+
+```bash
+hermes googlehome notify --status done --task "the nightly build"
+hermes googlehome notify --status blocked --task "the deploy" \
+  --detail "waiting on an API key" --speaker "living room speaker"
+```
 
 ## Cron notifications
 
@@ -368,6 +473,7 @@ of opening a second media server and Cast connection for the same speaker.
 | `speech_backend` | `auto` | `auto` \| `hermes` \| `sapi` \| `edge` |
 | `speech_voice` | `""` | voice name for `sapi` (`Microsoft Zira Desktop`) or `edge` (`en-US-AriaNeural`) |
 | `speak_replies` | `true` | cast every reply |
+| `muted` | `false` | silence everything spoken (replies, tools, notifications, cron); toggled by the status-bar popover's **Mute speaker** |
 | `speak_cron` | `true` | cast cron deliveries addressed to the speaker |
 | `proxy` | `false` | secondary-profile mode: forward to the primary bridge instead of opening a second media server |
 | `control_port` | `8765` | loopback port for the Desktop extension (auto-increments if busy) |
@@ -411,7 +517,8 @@ Two things worth knowing:
 | `No TTS provider is configured` | Hermes TTS has no usable provider. `auto` should fall back to the Windows engine; check `speech.last_backend` in `hermes googlehome status`, or pin `speech_backend: sapi`. |
 | Desktop page says bridge not connected | Gateway not running, or `control.json` missing: check `<HERMES_HOME>/googlehome/control.json`. |
 | `RuntimeStoreError('profile_mismatch')` | Declare the route: `hermes config set gateway.profile_routes '[{"platform":"googlehome","profile":"coder"}]'`. A plugin-side `SessionSource.profile` stamp alone does not move the session authority. |
-| Reply is a pairing code | Approve the speaker as a sender: `hermes -p <profile> pairing approve googlehome <CODE>`. |
+| The speaker reads the model's reasoning | `display.show_reasoning` is on globally. Set the per-platform override: `hermes config set display.platforms.googlehome.show_reasoning false` (already set here). The bridge also strips a leading rendered reasoning block before speech, so nothing is read aloud even without the override. |
+| Reply is a pairing code | The platform should be registered as `trusted_inbound` (it is, from this version): every inbound turn comes from the plugin's own token-gated loopback API, so the allowlist/pairing gate does not apply. On an older plugin, approve the sender once: `hermes -p <profile> pairing approve googlehome <CODE>`. |
 | First turn asks about a "home channel" | Answer it once (`ignore` is fine); it is the profile's delivery target for cron and cross-platform messages. |
 | `device closed the connection` on LOAD | The receiver was already running and the client LOADed on a transport it never opened a channel to. Fixed in `ensure_media_receiver()`; if you see it on an old install, re-sync the plugin. |
 | Flaky or slow cast while the gateway is up | Two clients on one device need distinct sender ids and their own `CONNECT`; both are handled now, but a stale plugin copy will not be. |
@@ -419,6 +526,7 @@ Two things worth knowing:
 | `hermes googlehome cron on` says no jobs | Cron stores are per profile: run it with the same `-p <profile>` the jobs belong to, or check `hermes -p <profile> cron list`. |
 | Cron jobs deliver but nothing is spoken | `speak_cron` is off, or the gateway is running the old plugin. Check `hermes googlehome cron status`, then restart the gateway after syncing the plugin. |
 | The speaker reads the job's whole report | The digest limit is `cron_max_chars` (default 400); make the job end with a `SPEAK: …` line to choose the exact sentence. |
+| `googlehome_notify` says no speaker matches | mDNS is blocked, or the room name differs from the Google Home app's. The error lists the names it found; pass the speaker's IP instead, or check `hermes googlehome devices`. |
 | Composer keeps saying Off while the speaker talks | The desktop extension is stale or the bridge is down: reload desktop plugins and check `hermes googlehome status`. The picker now mirrors `/playback`. |
 | Stop button never appears, bridge stops answering | The TTS provider is hanging inside the adapter (Hermes provider/network). Pin the offline engine: `hermes config set platforms.googlehome.extra.speech_backend sapi`, then restart the gateway. |
 | No stop control while the speaker talks | The gateway is running an older plugin, or the Desktop extension is stale: restart the gateway, then Ctrl+K → Reload desktop plugins. |
@@ -426,10 +534,11 @@ Two things worth knowing:
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -t .                    # 204 tests; adapter tests skip without core
+python -m unittest discover -s tests -t .                    # 262 tests; adapter tests skip without core
 $env:PYTHONPATH="$env:LOCALAPPDATA\hermes\hermes-agent"
-python -m unittest tests.test_adapter_integration            # 16 tests, needs Hermes core
-node tests/desktop/test_desktop_plugin.mjs                   # 16 loader/render checks
+& "$env:LOCALAPPDATA\hermes\hermes-agent\.venv\Scripts\python.exe" `
+  -m unittest tests.test_adapter_integration tests.test_reply_capture   # need Hermes core
+node tests/desktop/test_desktop_plugin.mjs                   # 27 loader/render/behaviour checks
 ```
 
 The Cast protocol is verified against `tests/mock_cast_device.py`, a TLS endpoint
@@ -452,6 +561,7 @@ googlehome/                 the installable plugin
   control.py                loopback control API for the Desktop extension
   playback.py               what is audible now, and how to stop it
   tools.py                  googlehome_* tools
+  notify.py                 one-line task outcomes, speaker-name matching
   ambient.py                per-conversation destinations + turn-end hook
   desktop/plugin.js         Desktop extension (plain ESM, no build)
 tests/                      protocol, media server, adapter, Desktop harness

@@ -1,7 +1,7 @@
 name: googlehome
 label: Google Home
 kind: platform
-version: 0.2.0
+version: 0.4.0
 author: karmsheel
 description: >
   Put a Google Home Mini (or any Google Home / Nest Cast speaker) on the other
@@ -9,13 +9,15 @@ description: >
   own TTS stack and cast to the speaker over the Cast v2 protocol (no
   third-party dependencies); voice input arrives through the host microphone and
   Hermes's STT, and each turn is routed to the profile you bind here. Adds
-  googlehome_speak, googlehome_status, googlehome_volume and googlehome_devices.
+  googlehome_speak, googlehome_notify, googlehome_status, googlehome_volume and
+  googlehome_devices.
 homepage: https://github.com/karmsheel/google-home
 requires_hermes: ">=0.21.5"
 manifest_version: 2
 python_dependencies: []
 provides_tools:
   - googlehome_speak
+  - googlehome_notify
   - googlehome_status
   - googlehome_volume
   - googlehome_devices
@@ -83,6 +85,14 @@ config_schema:
     default: true
     label: Speak replies
     description: Cast every agent reply to the speaker.
+  muted:
+    type: bool
+    default: false
+    label: Mute speaker
+    description: >
+      Silence every spoken output — replies, tools, notifications and cron —
+      until unmuted. This is the same switch the Desktop's status-bar speaker
+      popover uses, so the two always agree.
   speak_cron:
     type: bool
     default: true

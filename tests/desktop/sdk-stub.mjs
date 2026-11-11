@@ -31,6 +31,7 @@ export const SIDEBAR_NAV_AREA = 'sidebar.nav'
 export const PALETTE_AREA = 'palette'
 export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' }
 export const COMPOSER_AREAS = { actions: 'composer.actions' }
+export const SESSION_ROW_AREAS = { leading: 'sessionRow.leading', trailing: 'sessionRow.trailing' }
 
 export const host = {
   state: {
@@ -44,6 +45,28 @@ export const host = {
   notifyError() {},
   request: async () => ({}),
   requestProfile: async () => ({ text: '' }),
+  openSession: async () => {},
+  // The two sessions every test sees: one from the speaker, one ordinary chat.
+  listPersistedSessions: async () => ({
+    sessions: [
+      {
+        id: '20261109_200058_ad554bed',
+        source: 'googlehome',
+        title: 'Greet room and name model',
+        last_active: 1794340558,
+        started_at: 1794247258,
+        profile: 'coder'
+      },
+      {
+        id: 'local-chat-1',
+        source: 'desktop',
+        title: 'Some other chat',
+        last_active: 1794300000,
+        started_at: 1794200000,
+        profile: 'coder'
+      }
+    ]
+  }),
   profiles: {
     list: async () => ({ profiles: [{ name: 'coder' }, { name: 'designer' }] })
   }
@@ -57,11 +80,15 @@ function component(name) {
 
 export const Button = component('Button')
 export const ListRow = component('ListRow')
+export const Popover = component('Popover')
+export const PopoverContent = component('PopoverContent')
+export const PopoverTrigger = component('PopoverTrigger')
 export const Select = component('Select')
 export const SelectContent = component('SelectContent')
 export const SelectItem = component('SelectItem')
 export const SelectTrigger = component('SelectTrigger')
 export const SelectValue = component('SelectValue')
+export const Switch = component('Switch')
 export const Tip = component('Tip')
 export const icons = {
   Volume2: component('Volume2'),

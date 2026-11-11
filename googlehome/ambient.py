@@ -29,8 +29,10 @@ MODES = {"off", "speaker"}
 STALE_MS = 12 * 60 * 60 * 1000
 MAX_ENTRIES = 200
 
-#: A turn that already spoke through a tool is not spoken again.
-SPEAKING_TOOLS = {"googlehome_speak"}
+#: A turn that already spoke through a tool is not spoken again. A notification
+#: is the deliberate alternative to reading the reply out, so it counts too:
+#: the room hears the one-line outcome, not the whole answer.
+SPEAKING_TOOLS = {"googlehome_speak", "googlehome_notify"}
 
 #: Platforms whose own adapter speaks the reply (cron has cronlink).
 PLATFORMS_THAT_SPEAK = {"googlehome", "cron"}
