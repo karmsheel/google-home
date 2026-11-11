@@ -254,6 +254,117 @@ class AdapterOutboundTests(unittest.TestCase):
         self.assertEqual(event.text, "what is the weather")
         self.assertEqual(event.source.profile, "coder")
         self.assertEqual(event.source.chat_id, "speaker-127.0.0.1")
+
+    def _speaker_session(self):
+        """A real session store holding the speaker's route, as the gateway wires it."""
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+
+        store = SessionStore(self.home / "sessions", GatewayConfig())
+        self.addCleanup(store.close_all_db_handles)
+        source = self.adapter.build_source(
+            chat_id=self.adapter.settings.chat_id,
+            chat_name="Google Home",
+            chat_type="dm",
+            user_id="speaker",
+            user_name="Speaker",
+        )
+        entry = store.get_or_create_session(source)
+        db = store._db_for_key(entry.session_key)
+        return store, entry, db
+
+    def _submit_with_store(self, store, text="hello"):
+        self.adapter._session_store = store
+
+        async def scenario():
+            self.adapter._loop = asyncio.get_running_loop()
+            await self.adapter.submit_utterance(text, origin="desktop")
+
+        asyncio.run(scenario())
+
+    def test_archived_speaker_conversation_is_replaced_with_a_fresh_one(self):
+        """Archiving the Google Home chat must not keep speaking into a hidden session."""
+        store, entry, db = self._speaker_session()
+        db.set_session_archived(entry.session_id, True)
+
+        self._submit_with_store(store)
+
+        replacement = store.lookup_by_session_key(entry.session_key)
+        self.assertNotEqual(replacement.session_id, entry.session_id)
+        self.assertFalse(db.get_session_list_row(replacement.session_id)["archived"])
+        self.assertIsNotNone(db.get_session_list_row(entry.session_id)["ended_at"])
+        self.assertEqual(len(self.events), 1, "the turn must still run")
+
+    def test_live_speaker_conversation_is_continued(self):
+        store, entry, db = self._speaker_session()
+
+        self._submit_with_store(store)
+
+        self.assertEqual(store.lookup_by_session_key(entry.session_key).session_id, entry.session_id)
+        self.assertIsNone(db.get_session_list_row(entry.session_id)["ended_at"])
+        self.assertEqual(len(self.events), 1)
+
+    def test_deleted_speaker_conversation_gets_a_fresh_one(self):
+        """A hard-deleted row is replaced even if the router's own self-heal misses it."""
+        store, entry, db = self._speaker_session()
+        delete = getattr(db, "delete_session", None)
+        if not callable(delete):
+            self.skipTest("this Hermes build has no SessionDB.delete_session")
+        delete(entry.session_id)
+
+        self._submit_with_store(store)
+
+        replacement = store.lookup_by_session_key(entry.session_key)
+        self.assertNotEqual(replacement.session_id, entry.session_id)
+        self.assertIsNotNone(db.get_session_list_row(replacement.session_id))
+        self.assertEqual(len(self.events), 1)
+
+    def test_a_broken_session_store_never_blocks_the_turn(self):
+        class BrokenStore:
+            def _generate_session_key(self, source):
+                return "agent:main:googlehome:dm:speaker-127.0.0.1"
+
+            def lookup_by_session_key(self, key):
+                raise RuntimeError("state.db is unreadable")
+
+            def reset_session(self, key):
+                raise AssertionError("an unreadable store must not be reset")
+
+        self._submit_with_store(BrokenStore())
+
+        self.assertEqual(len(self.events), 1)
+
+    def test_an_unreadable_session_store_is_not_mistaken_for_a_deleted_one(self):
+        """A once-in-a-while DB failure must not mint a new conversation every turn."""
+        from types import SimpleNamespace
+
+        class NoDbStore:
+            started = False
+            reset = False
+
+            def _generate_session_key(self, source):
+                return "agent:main:googlehome:dm:speaker-127.0.0.1"
+
+            def lookup_by_session_key(self, key):
+                return SimpleNamespace(session_key=key, session_id="20260101_000000_deadbeef")
+
+            def _db_for_key(self, key):
+                return None
+
+            def get_or_create_session(self, source, force_new=False):
+                self.started = True
+
+            def reset_session(self, key):
+                self.reset = True
+
+        store = NoDbStore()
+
+        self._submit_with_store(store)
+
+        self.assertFalse(store.started, "an unreadable store must not start a session")
+        self.assertFalse(store.reset, "an unreadable store must not reset the route")
+        self.assertEqual(len(self.events), 1)
+
     def test_control_file_is_written_and_removed(self):
         with self._patch_discovery(), mock.patch(
             "googlehome.speech.synthesize", return_value=[str(self.wav)]

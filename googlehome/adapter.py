@@ -85,6 +85,11 @@ _CAPTURE_LIMIT = 32
 #: The resolved profile is re-read at most this often by ``status()``.
 _ROUTE_CACHE_SECONDS = 15.0
 
+#: Sentinels for a conversation row lookup: a missing row is actionable, while
+#: an unreadable store must leave the route alone rather than minting a session
+#: on every turn.
+_SESSION_ROW_UNKNOWN = object()
+
 #: The reasoning block Hermes prepends for display when ``display.show_reasoning``
 #: is on: ``💭 **Reasoning:**`` then a fenced block, then the answer. The label is
 #: localized, so match the shape (emoji + fence), not the words.
@@ -132,6 +137,9 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._client: Optional[castdevice.CastClient] = None
         self._speak_lock = threading.Lock()
+        # Serializes the archived-session check-and-reset: two turns arriving at
+        # once must not each mint a successor for the same hidden conversation.
+        self._conversation_lock = threading.Lock()
         self._device: dict[str, Any] = {}
         # Desktop turn replies: ``POST /ask`` / ``POST /listen`` hand back a
         # token, and the page polls ``GET /reply`` for the text it could not
@@ -787,6 +795,11 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             # unrouted case needs the legacy stamp.
             source.profile = self.settings.profile
 
+        # The page is a continuation surface, not a session picker. If the
+        # speaker's bound session was archived out from under it, give the turn
+        # a fresh one instead of appending to a conversation no sidebar lists.
+        await self._ensure_active_conversation(source)
+
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -864,6 +877,96 @@ class GoogleHomeAdapter(BasePlatformAdapter):
         from tools.voice_mode import transcribe_recording
 
         return transcribe_recording(path)
+
+    # ── the conversation behind the speaker ──────────────────────────────────
+    def _session_row_for(self, store: Any, entry: Any) -> Any:
+        """State.db row for a routing entry, None when the row is gone, or
+        ``_SESSION_ROW_UNKNOWN`` when the store cannot answer.
+
+        Archived is a sidebar flag that the router deliberately does not treat as
+        "ended", so this is the one place the bridge has to look at it.
+        """
+        session_id = str(getattr(entry, "session_id", "") or "")
+        if not session_id:
+            return _SESSION_ROW_UNKNOWN
+        db_for = getattr(store, "_db_for_key", None)
+        if not callable(db_for):
+            return _SESSION_ROW_UNKNOWN
+        db = db_for(getattr(entry, "session_key", ""))
+        if db is None:
+            return _SESSION_ROW_UNKNOWN
+        row_for = getattr(db, "get_session_list_row", None) or getattr(db, "get_session", None)
+        if not callable(row_for):
+            return _SESSION_ROW_UNKNOWN
+        row = row_for(session_id)
+        return dict(row) if row else None
+
+    def _reset_if_archived_or_missing(self, source: Any) -> bool:
+        """Mint a fresh conversation when the bound one is archived or gone.
+
+        Archiving is a sidebar decision, not an end-of-conversation signal, so
+        Hermes' session router keeps routing new turns to the archived session.
+        The turn is then spoken while no unarchived row is left to open, which
+        strands the page: it can hear the reply but cannot show the
+        conversation. Hermes normally self-heals a deleted/ended row, but the
+        page's promise should not depend on that, so a missing row resets too.
+        Either way the next turn starts a conversation the sidebar can list,
+        exactly as the Desktop's own "new conversation" would.
+
+        Returns True when a new session was started.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return False
+        # The adapter is wired with the synchronous store; unwrap the async
+        # facade so this can run off the event loop.
+        store = getattr(store, "_store", store)
+        key_for = getattr(store, "_generate_session_key", None)
+        lookup = getattr(store, "lookup_by_session_key", None)
+        if not (callable(key_for) and callable(lookup)):
+            return False
+        with self._conversation_lock:
+            entry = lookup(key_for(source))
+            if entry is None:
+                return False
+            row = self._session_row_for(store, entry)
+            if row is _SESSION_ROW_UNKNOWN:
+                return False
+            if row is None:
+                # The session row was hard-deleted while the route still named
+                # it. A plain reset would create the successor with the deleted
+                # id as its parent and fail the foreign key; a forced route
+                # transition starts clean instead.
+                start = getattr(store, "get_or_create_session", None)
+                if not callable(start):
+                    return False
+                start(source, force_new=True)
+                logger.info(
+                    "[%s] the speaker's conversation %s is missing; starting a new session",
+                    PLATFORM_NAME,
+                    entry.session_id,
+                )
+                return True
+            if not row.get("archived"):
+                return False
+            reset = getattr(store, "reset_session", None)
+            if not callable(reset):
+                return False
+            reset(entry.session_key)
+            logger.info(
+                "[%s] the speaker's conversation %s was archived; starting a new session",
+                PLATFORM_NAME,
+                entry.session_id,
+            )
+            return True
+
+    async def _ensure_active_conversation(self, source: Any) -> None:
+        """Apply the archived-session rule without ever blocking a turn on it."""
+        try:
+            await asyncio.to_thread(self._reset_if_archived_or_missing, source)
+        except Exception as exc:  # noqa: BLE001 - a stale route must not mute the turn
+            logger.debug("[%s] could not refresh the speaker's conversation: %s",
+                         PLATFORM_NAME, exc)
 
     # ── status / control helpers ─────────────────────────────────────────────
     def effective_profile(self, *, refresh: bool = False) -> str:
