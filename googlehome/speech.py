@@ -223,6 +223,26 @@ def _import_edge_tts() -> Any:
         raise RuntimeError(f"the edge-tts package is not installed ({exc!r})") from exc
 
 
+def _run_coroutine(coro_factory: Callable[[], Any]) -> Any:
+    """Run a coroutine from sync code, even if the caller owns a running loop.
+
+    Tool handlers can execute on the gateway's event loop, where ``asyncio.run``
+    raises "cannot be called from a running event loop". In that case hand the
+    work to a private loop on a worker thread — the same shape core's own edge
+    generator uses.
+    """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro_factory())).result()
+
+
 def _synth_edge(text: str, provider: str, voice: str) -> list[str]:
     edge_tts = _import_edge_tts()
 
@@ -238,10 +258,8 @@ def _synth_edge(text: str, provider: str, voice: str) -> list[str]:
             communicate = edge_tts.Communicate(chunk_text, chosen)
             await communicate.save(str(out_path))
 
-        import asyncio
-
         try:
-            asyncio.run(_run(chunk, target))
+            _run_coroutine(lambda: _run(chunk, target))
         except Exception as exc:  # noqa: BLE001 - network, protocol, token errors
             raise RuntimeError(f"edge-tts failed: {str(exc)[:200]}") from exc
         if not target.is_file() or target.stat().st_size < 512:

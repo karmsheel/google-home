@@ -18,6 +18,7 @@ Responsibilities
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import threading
@@ -307,6 +308,80 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             await self._refresh_device()
             await asyncio.to_thread(self._play_blocking, paths)
 
+    # ── profile secret scope ─────────────────────────────────────────────────
+    def _profile_home(self) -> Path:
+        """The HERMES_HOME whose credentials this adapter's speech calls must use."""
+        name = (self.settings.profile or "").strip()
+        if name:
+            try:
+                from hermes_cli.profiles import get_profile_dir, profile_exists
+
+                if profile_exists(name):
+                    return Path(get_profile_dir(name))
+                logger.warning("[%s] profile %r does not exist; using the active home",
+                               PLATFORM_NAME, name)
+            except Exception as exc:  # noqa: BLE001 - profile helpers are best effort
+                logger.debug("[%s] profile lookup failed: %s", PLATFORM_NAME, exc)
+        try:
+            from hermes_constants import get_hermes_home
+
+            return Path(get_hermes_home())
+        except Exception:  # noqa: BLE001
+            return ghconfig.hermes_home()
+
+    @contextlib.contextmanager
+    def _profile_scope(self):
+        """Install this adapter's profile scope around a credential-using call.
+
+        A multiplexing gateway refuses secret reads from unscoped tasks
+        (``agent.secret_scope.UnscopedSecretError``: "Hermes could not read this
+        profile's XAI_BASE_URL …") rather than borrowing another profile's
+        credentials. Turns run inside ``_profile_runtime_scope``, but the control
+        API, cron links and ambient speech call in from outside any turn, so the
+        adapter installs its own scope — the per-adapter scope that error names.
+        """
+        home = self._profile_home()
+        tokens: list[tuple[str, Any]] = []
+        try:
+            try:
+                from hermes_constants import set_hermes_home_override
+
+                tokens.append(("home", set_hermes_home_override(str(home))))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[%s] no HERMES_HOME override: %s", PLATFORM_NAME, exc)
+            try:
+                from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+
+                tokens.append(("secret", set_secret_scope(
+                    build_profile_secret_scope(home), profile_home=str(home))))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[%s] no secret scope: %s", PLATFORM_NAME, exc)
+            yield
+        finally:
+            while tokens:
+                kind, token = tokens.pop()
+                try:
+                    if kind == "secret":
+                        from agent.secret_scope import reset_secret_scope
+
+                        reset_secret_scope(token)
+                    else:
+                        from hermes_constants import reset_hermes_home_override
+
+                        reset_hermes_home_override(token)
+                except Exception:  # noqa: BLE001 - unwinding must never raise
+                    pass
+
+    def _synthesize(self, text: str) -> list[str]:
+        """Synthesize on a worker thread, inside the profile scope."""
+        with self._profile_scope():
+            return speech.synthesize(
+                text,
+                provider=self.settings.tts_provider,
+                backend=self.settings.speech_backend,
+                voice=self.settings.speech_voice,
+            )
+
     # ── outbound ─────────────────────────────────────────────────────────────
     def _spoken_text(self, content: str) -> str:
         text = content or ""
@@ -334,13 +409,7 @@ class GoogleHomeAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=f"gh-empty-{uuid.uuid4().hex[:8]}")
 
         try:
-            files = await asyncio.to_thread(
-                speech.synthesize,
-                text,
-                provider=self.settings.tts_provider,
-                backend=self.settings.speech_backend,
-                voice=self.settings.speech_voice,
-            )
+            files = await asyncio.to_thread(self._synthesize, text)
         except speech.TtsUnavailable as exc:
             self.last_error = str(exc)
             logger.warning("[%s] %s", PLATFORM_NAME, exc)
