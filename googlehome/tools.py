@@ -13,8 +13,14 @@ from typing import Any, Optional
 
 from . import castdevice, discovery, notify, playback, speech
 from . import config as ghconfig
-from .adapter import active_adapter
 from .audioserver import MediaServer, content_type_for
+
+try:  # the adapter needs Hermes core; tools stay importable without it
+    from .adapter import active_adapter
+except Exception:  # pragma: no cover - exercised by the core-less test run
+    def active_adapter() -> None:
+        """No gateway in this process, so no live speaker adapter either."""
+        return None
 
 logger = logging.getLogger(__name__)
 
