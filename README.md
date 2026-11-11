@@ -60,6 +60,24 @@ Two details that matter:
   `<HERMES_HOME>/googlehome/control.json` with `{port, token}`; the extension
   reads it through the Electron bridge and talks to that port.
 
+## What it touches
+
+Disclosure, for anyone installing this on a network they care about:
+
+- **Your speaker, on the LAN.** Cast v2 over TLS 8009, after mDNS discovery. The
+  speaker fetches the spoken MP3 from this machine.
+- **A media server on every interface.** The pinned media port (`8766`) serves
+  only the clip directory, without authentication — the speaker has no way to
+  send a credential. Scope it with the firewall rule in *Install*.
+- **A loopback control API.** `127.0.0.1` only, gated by the `X-Hermes-Token`
+  from `control.json`. It can start turns, accept recorded audio, set volume,
+  mute, and stop playback. It is the Desktop extension's only door.
+- **Subprocesses for speech.** Windows SAPI runs through `powershell` (offline);
+  `edge-tts` is used only when you pick that backend and calls Microsoft's cloud.
+- **No credentials and no telemetry.** No environment variables, no third-party
+  accounts, no usage reporting. The only secret stored is the local control
+  token, in `HERMES_HOME`.
+
 ## Install
 
 ### 1. Agent plugin
