@@ -8,19 +8,23 @@ speaker is one gateway-wide adapter: enabling ``platforms.googlehome`` in every
 profile's config would start a second adapter for each profile and the two
 would fight over the device and its media port.
 
-The deliver-string rewriting here is deliberately free of Hermes imports so
-the stdlib-only test suite can cover it. Only :func:`apply_jobs` and
-:func:`platform_ready` touch cron/gateway internals, and they import lazily.
+This module never opens the cron store. Reads go through ``hermes cron list``
+and writes through ``hermes cron edit <id> --deliver <target>``, both public
+commands, so a change to the on-disk job shape can never strand the plugin
+(or race the scheduler's own lock). The deliver-string rewriting stays free of
+Hermes imports so the stdlib-only test suite can cover it.
 """
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -133,21 +137,28 @@ def candidate_homes() -> list[Path]:
     """Hermes homes that could hold the gateway's ``control.json``.
 
     The gateway usually runs as the default profile while a ``-p <name>`` CLI
-    invocation has ``HERMES_HOME`` pointed at the profile, so both are checked.
+    invocation has a profile home, so both the active home and the root that
+    holds ``profiles/`` are checked. Paths come from ``hermes_constants`` (the
+    public helpers) rather than a bare environment read.
     """
     homes: list[Path] = []
-    raw = os.environ.get("HERMES_HOME", "").strip()
-    if raw:
-        here = Path(raw)
-        homes.append(here)
-        if here.parent.name.lower() == "profiles":
-            homes.append(here.parent.parent)
-    elif sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA", "").strip()
-        if local:
-            homes.append(Path(local) / "hermes")
-    else:
-        homes.append(Path.home() / ".hermes")
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+
+        homes = [Path(get_hermes_home()), Path(get_default_hermes_root())]
+    except Exception:  # noqa: BLE001 - stdlib tests do not import Hermes core
+        raw = os.environ.get("HERMES_HOME", "").strip()
+        if raw:
+            here = Path(raw)
+            homes.append(here)
+            if here.parent.name.lower() == "profiles":
+                homes.append(here.parent.parent)
+        elif sys.platform == "win32":
+            local = os.environ.get("LOCALAPPDATA", "").strip()
+            if local:
+                homes.append(Path(local) / "hermes")
+        else:
+            homes.append(Path.home() / ".hermes")
 
     seen: set[str] = set()
     unique: list[Path] = []
@@ -161,97 +172,164 @@ def candidate_homes() -> list[Path]:
 
 def profile_label(home: Path | str | None = None) -> str:
     """Display name of a Hermes home, or of this process's profile."""
-    raw = str(home) if home is not None else os.environ.get("HERMES_HOME", "").strip()
+    if home is not None:
+        raw = str(home)
+    else:
+        try:
+            from hermes_constants import get_hermes_home
+
+            raw = str(get_hermes_home())
+        except Exception:  # noqa: BLE001 - stdlib tests do not import Hermes core
+            raw = os.environ.get("HERMES_HOME", "").strip()
     if not raw:
         return "default"
     path = Path(raw)
     return path.name if path.parent.name.lower() == "profiles" else "default"
 
 
-# ── Hermes glue (lazy imports) ───────────────────────────────────────────────
-def _cron_jobs() -> Any:
-    from cron import jobs as cron_jobs
+# ── Hermes CLI (public commands only) ────────────────────────────────────────
+_COMMAND_TIMEOUT = 120.0
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+#: `hermes cron list` prints one job per `  <id> [state]` line, then indented
+#: `Label: value` detail rows. Read only the two fields this plugin needs.
+_JOB_LINE = re.compile(r"^\s{2}(?P<id>\S+)\s+\[(?P<state>active|paused|disabled|completed)\]\s*$")
+_DETAIL_LINE = re.compile(r"^\s{4}(?P<label>[A-Za-z][A-Za-z ]*):\s+(?P<value>.*)$")
 
-    return cron_jobs
+
+def hermes_command() -> list[str]:
+    """The ``hermes`` executable, for the two public cron commands used here."""
+    exe = shutil.which("hermes")
+    if exe:
+        return [exe]
+    argv0 = str(sys.argv[0] if sys.argv else "").strip()
+    if argv0 and Path(argv0).name.lower().startswith("hermes"):
+        return [argv0]
+    raise RuntimeError(
+        "could not find the `hermes` command; run this through the hermes CLI"
+    )
 
 
-@contextlib.contextmanager
-def _store(cron_jobs: Any, home: Path | None) -> Iterator[None]:
-    """Route the cron store at another profile's home, when asked.
+def _run_hermes(
+    args: list[str], *, home: Path | None = None, timeout: float = _COMMAND_TIMEOUT
+) -> str:
+    """Run a public ``hermes`` command and return its stdout.
 
-    The plugin is discoverable from the default home only (Hermes scans
-    ``$HERMES_HOME/plugins``), so ``hermes -p researcher googlehome`` cannot
-    load this command. ``--profile`` keeps one command working for every
-    profile while the store is switched underneath it.
+    ``home`` selects another profile's store by pointing the child at that
+    ``HERMES_HOME`` — the same contract ``hermes -p <name>`` uses — so no
+    in-process store switching (and no private lock) is involved.
     """
-    if home is None:
-        yield
-        return
-    use = getattr(cron_jobs, "use_cron_store", None)
-    if not callable(use):
-        raise RuntimeError("this Hermes build cannot address another profile's cron store")
-    with use(home):
-        yield
+    env = dict(os.environ)
+    if home is not None:
+        env["HERMES_HOME"] = str(home)
+    command = [*hermes_command(), *args]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not run `{' '.join(command)}`: {exc}") from exc
+    if result.returncode != 0:
+        detail = _ANSI.sub("", (result.stderr or result.stdout or "").strip())
+        reason = detail[-400:] or f"exit {result.returncode}"
+        raise RuntimeError(f"`{' '.join(command)}` failed: {reason}")
+    return result.stdout or ""
 
 
-@contextlib.contextmanager
-def _locked(cron_jobs: Any) -> Iterator[None]:
-    """The same load→modify→save critical section Hermes' own CLI uses."""
-    lock = getattr(cron_jobs, "_jobs_lock", None)
-    if lock is None:
-        yield
-        return
-    with lock():
-        yield
+def edit_command(job_id: str, deliver: str) -> str:
+    """The public command that sets a job's delivery list."""
+    return f"hermes cron edit {job_id} --deliver {deliver}"
+
+
+def edit_deliver(job_id: str, deliver: str, *, home: Path | None = None) -> str:
+    """Apply a job's new delivery list through ``hermes cron edit``."""
+    _run_hermes(["cron", "edit", job_id, "--deliver", deliver], home=home)
+    return edit_command(job_id, deliver)
+
+
+def parse_jobs(text: str) -> list[dict[str, Any]]:
+    """Parse ``hermes cron list`` output into the rows this plugin reports.
+
+    Raises when the output does not look like a job listing at all (an empty
+    store says so in words); silently returning "no jobs" would make
+    ``cron on`` claim success while doing nothing after a CLI layout change.
+    """
+    jobs: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in text.splitlines():
+        header = _JOB_LINE.match(line)
+        if header:
+            current = {
+                "id": header.group("id"),
+                "name": "",
+                "enabled": header.group("state") == "active",
+                "deliver": LOCAL,
+                "attached": False,
+            }
+            jobs.append(current)
+            continue
+        if current is None:
+            continue
+        detail = _DETAIL_LINE.match(line)
+        if not detail:
+            continue
+        label = detail.group("label").strip().lower()
+        value = detail.group("value").strip()
+        if label == "name" and value:
+            current["name"] = value
+        elif label == "deliver":
+            current["deliver"] = deliver_to_string(parse_deliver(value))
+
+    if not jobs and text.strip() and "no scheduled jobs" not in text.lower():
+        raise RuntimeError(
+            "could not read `hermes cron list` output; this Hermes version may "
+            "have changed its layout"
+        )
+    for job in jobs:
+        job["name"] = job["name"] or job["id"]
+        job["attached"] = is_attached(job["deliver"])
+    return jobs
+
+
+def list_jobs(home: Path | None = None) -> list[dict[str, Any]]:
+    """Current jobs with their attach state, read through ``hermes cron list``."""
+    return parse_jobs(_ANSI.sub("", _run_hermes(["cron", "list", "--all"], home=home)))
 
 
 def apply_jobs(
     action: str, chat_id: str, *, dry_run: bool = False, home: Path | None = None
 ) -> list[dict[str, Any]]:
-    """Attach (``on``) or detach (``off``) the speaker on every job of a profile."""
+    """Attach (``on``) or detach (``off``) the speaker on every job of a profile.
+
+    Each changed job is updated with its own ``hermes cron edit`` call, so the
+    scheduler's store lock stays Hermes's business. ``dry_run`` only computes
+    the commands (and never runs them), which the CLI prints.
+    """
     if action not in ("on", "off"):
         raise ValueError(f"unknown cron action {action!r}")
-    cron_jobs = _cron_jobs()
     rows: list[dict[str, Any]] = []
-    with _store(cron_jobs, home), _locked(cron_jobs):
-        jobs = cron_jobs.load_jobs()
-        for job in jobs:
-            before = job.get("deliver", LOCAL)
-            after, changed = attach(before, chat_id) if action == "on" else detach(before)
-            rows.append({
-                "id": job.get("id", ""),
-                "name": job.get("name", "") or job.get("id", ""),
-                "enabled": bool(job.get("enabled", True)),
-                "before": deliver_to_string(parse_deliver(before)),
-                "after": after,
-                "changed": changed,
-            })
-            if changed and not dry_run:
-                job["deliver"] = after
-        if not dry_run and any(row["changed"] for row in rows):
-            cron_jobs.save_jobs(jobs)
+    for job in list_jobs(home=home):
+        before = job.get("deliver", LOCAL)
+        after, changed = attach(before, chat_id) if action == "on" else detach(before)
+        command = edit_command(job.get("id", ""), after) if changed else ""
+        row = {
+            "id": job.get("id", ""),
+            "name": job.get("name", "") or job.get("id", ""),
+            "enabled": bool(job.get("enabled", True)),
+            "before": deliver_to_string(parse_deliver(before)),
+            "after": after,
+            "changed": changed,
+            "command": command,
+        }
+        rows.append(row)
+        if changed and not dry_run:
+            edit_deliver(job.get("id", ""), after, home=home)
     return rows
-
-
-def list_jobs(home: Path | None = None) -> list[dict[str, Any]]:
-    """Current jobs with their attach state, for ``cron status``."""
-    cron_jobs = _cron_jobs()
-    with _store(cron_jobs, home), _locked(cron_jobs):
-        jobs = cron_jobs.load_jobs()
-        return [
-            {
-                "id": job.get("id", ""),
-                "name": job.get("name", "") or job.get("id", ""),
-                "enabled": bool(job.get("enabled", True)),
-                "deliver": deliver_to_string(parse_deliver(job.get("deliver", LOCAL))),
-                "failure_deliver": (
-                    deliver_to_string(parse_deliver(job.get("failure_deliver")))
-                    if job.get("failure_deliver") else ""
-                ),
-                "attached": is_attached(job.get("deliver")),
-            }
-            for job in jobs
-        ]
 
 
 def platform_ready() -> bool:

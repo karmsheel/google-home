@@ -1,7 +1,7 @@
 name: googlehome
 label: Google Home
 kind: platform
-version: 0.4.0
+version: 0.4.1
 author: karmsheel
 description: >
   Put a Google Home Mini (or any Google Home / Nest Cast speaker) on the other

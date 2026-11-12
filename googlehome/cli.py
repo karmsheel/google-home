@@ -12,6 +12,7 @@ import json
 import logging
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from . import castdevice, discovery
@@ -368,11 +369,8 @@ def _cron(args: Any) -> int:
     except ValueError as exc:
         print(str(exc))
         return 2
-    except ImportError:
-        print(
-            "Hermes cron is not available in this environment. Run this through the\n"
-            "`hermes` command so the cron store and profile are on the path."
-        )
+    except RuntimeError as exc:
+        print(str(exc))
         return 1
     except Exception as exc:  # noqa: BLE001 - a CLI failure should be readable
         logger.debug("cron wiring failed", exc_info=True)
@@ -385,12 +383,20 @@ def _cron_profile_home(name: str):
     name = (name or "").strip()
     if not name:
         return None
-    from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
-
-    canonical = normalize_profile_name(name)
-    if not profile_exists(canonical):
+    try:
+        from hermes_constants import (
+            get_default_hermes_root,
+            named_profile_home,
+            named_profile_is_live,
+        )
+    except Exception as exc:  # noqa: BLE001 - stdlib-only installs have no profiles
+        raise RuntimeError(
+            "this Hermes build cannot address another profile; drop --cron-profile"
+        ) from exc
+    home = named_profile_home(Path(get_default_hermes_root()) / "profiles" / name)
+    if home is None or not named_profile_is_live(home):
         raise ValueError(f"no Hermes profile named {name!r}")
-    return get_profile_dir(canonical)
+    return home
 
 
 def _cron_test(chat_id: str, as_json: bool) -> int:
@@ -460,8 +466,6 @@ def _cron_status(chat_id: str, settings: Any, as_json: bool, *, home: Any, label
         state = "" if job["enabled"] else " (paused)"
         print(f"  · [{mark}] {job['name']}{state}")
         print(f"      deliver: {job['deliver']}")
-        if job["failure_deliver"]:
-            print(f"      failures: {job['failure_deliver']}")
     return 0
 
 
@@ -499,6 +503,8 @@ def _cron_toggle(
         if row["changed"]:
             print(f"  · {row['name']}")
             print(f"      {row['before']}  →  {row['after']}")
+            if dry_run and row.get("command"):
+                print(f"      {row['command']}")
         else:
             print(f"  · {row['name']}  (already {'attached' if state == 'on' else 'clear'})")
 
@@ -510,6 +516,11 @@ def _cron_toggle(
     else:
         print(f"\nNothing to change; all {len(rows)} job(s) are already in the right state.")
 
+    if dry_run and changed:
+        print(
+            "\nDry run — nothing was written. Run the commands above, or drop\n"
+            "--dry-run to have this command run them."
+        )
     if state == "on" and not dry_run:
         print(
             "The next scheduler tick reads the new delivery list (no gateway restart needed).\n"

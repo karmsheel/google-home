@@ -1,0 +1,12 @@
+{
+  "name": "googlehome",
+  "label": "Google Home",
+  "description": "Backend for the Google Home Desktop extension: proxies the bridge's loopback control API so the renderer never reads control.json or holds the token.",
+  "icon": "broadcast",
+  "version": "0.4.1",
+  "tab": {
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

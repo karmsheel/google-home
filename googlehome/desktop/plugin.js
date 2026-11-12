@@ -14,9 +14,11 @@
  * to the bridge, and the bridge transcribes it and runs the turn as the bound
  * profile. The reply is spoken by the speaker.
  *
- * Transport: the Python adapter writes <HERMES_HOME>/googlehome/control.json
- * with {port, token}; we read it through the Electron bridge and talk to that
- * loopback port directly.
+ * Transport: the renderer never reads the bridge's control file and never holds
+ * its token. It calls this package's dashboard backend through ctx.rest
+ * (`/api/plugins/googlehome/...`), and that backend — running on the machine
+ * with the gateway — reads the file and proxies to the loopback bridge. That
+ * keeps the token in Python and works against a remote Desktop.
  */
 import {
   atom,
@@ -45,7 +47,6 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'googlehome'
 const ROUTE = '/googlehome'
-const CONTROL_TTL_MS = 5000
 const STATUS_POLL_MS = 3000
 // A turn can take minutes (tools, approvals). The page keeps polling without
 // holding the talk button hostage, then settles on whatever the bridge recorded.
@@ -110,7 +111,6 @@ const $activeProfile =
 // the UI keeps its previous (always-visible) behaviour.
 const $profileInfo = atom({ known: false, bridge_profile: '', plugin_profiles: [] })
 
-let control = { info: null, at: 0 }
 let recorder = null
 let chunks = []
 let noticeTimer = null
@@ -120,6 +120,9 @@ let profileInfoAt = 0
 // Plugin-scoped persistence, handed over by register(); a missing door keeps
 // the popover working for this run and simply forgets the picker preference.
 let pluginStorage = null
+// The host context, kept for its `rest` door: every bridge call goes through
+// this package's dashboard backend, never through Electron's native bridge.
+let pluginCtx = null
 const COMPOSER_HIDDEN_KEY = 'composerPickerHidden'
 // Which profile the conversations list was last read for; the routed profile
 // can change under us (a settings edit, a profile_routes change).
@@ -146,79 +149,55 @@ function hapticTap() {
   }
 }
 
-function dirname(path) {
-  const trimmed = String(path || '').replace(/[\\/]+$/, '')
-  const index = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
-  return index > 0 ? trimmed.slice(0, index) : ''
-}
-
-function joinPath(base, parts) {
-  const separator = base.includes('\\') ? '\\' : '/'
-  return [String(base).replace(/[\\/]+$/, ''), ...parts].join(separator)
-}
-
-async function controlInfo(force) {
-  const now = Date.now()
-  if (!force && control.info && now - control.at < CONTROL_TTL_MS) return control.info
-  const bridge = typeof window !== 'undefined' ? window.hermesDesktop : null
-  if (!bridge || typeof bridge.desktopPluginsRoot !== 'function') {
-    control = { info: null, at: now }
-    return null
-  }
-  let root = ''
+/** The host's rejection into something the page can show. */
+function restError(error) {
+  const message = errorText(error, 'the bridge did not answer')
+  // `ctx.rest` reports "<status>: {json}" for a non-2xx answer; unwrap the
+  // backend's `detail`/`error` sentence when there is one.
+  const match = /^(\d{3}):\s*([\s\S]*)$/.exec(message)
+  if (!match) return message
+  const status = Number(match[1])
+  let detail = ''
   try {
-    root = await bridge.desktopPluginsRoot()
+    const parsed = JSON.parse(match[2])
+    detail = String((parsed && (parsed.detail || parsed.error)) || '')
   } catch {
-    root = ''
+    detail = match[2].trim()
   }
-  const home = root ? dirname(root) : ''
-  const activeProfile = host.state && host.state.profile ? host.state.profile.get() : ''
-  const candidates = []
-  if (home) {
-    candidates.push(joinPath(home, ['googlehome', 'control.json']))
-    if (activeProfile) {
-      candidates.push(joinPath(home, ['profiles', activeProfile, 'googlehome', 'control.json']))
-    }
-  }
-  for (const path of candidates) {
-    try {
-      const result = typeof bridge.readFileText === 'function' ? await bridge.readFileText(path) : null
-      if (result && result.text && !result.truncated) {
-        const info = JSON.parse(result.text)
-        control = { info, at: now }
-        return info
-      }
-    } catch {
-      /* try the next candidate */
-    }
-  }
-  control = { info: null, at: now }
-  return null
-}
-
-async function bridgeApi(path, options) {
-  const opts = options || {}
-  const info = opts.info || (await controlInfo())
-  if (!info || !info.port) {
-    throw new Error(
-      'The Google Home bridge is not connected. Install the plugin, start the Hermes gateway, then retry.'
+  if (status === 404) {
+    return (
+      'The Google Home backend is not loaded in this profile. Enable the plugin, ' +
+      'then restart the gateway or reload desktop plugins.'
     )
   }
-  const headers = { 'Content-Type': 'application/json' }
-  if (info.token) headers['X-Hermes-Token'] = info.token
-  const response = await fetch(`http://127.0.0.1:${info.port}${path}`, {
-    method: opts.method || 'GET',
-    headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined
-  })
-  let data = {}
-  try {
-    data = await response.json()
-  } catch {
-    data = {}
+  if (detail) return detail
+  return `The Google Home bridge answered ${status}`
+}
+
+/**
+ * One call to the bridge, through this package's dashboard backend.
+ *
+ * `ctx.rest` is namespace-scoped (`/api/plugins/googlehome/<path>`), carries the
+ * profile/connection scope, and runs on the Hermes host — so the renderer needs
+ * neither the control port nor the token.
+ */
+async function bridgeApi(path, options) {
+  const opts = options || {}
+  if (!pluginCtx || typeof pluginCtx.rest !== 'function') {
+    throw new Error(
+      'This Hermes Desktop cannot reach the Google Home backend. Update Desktop, then retry.'
+    )
   }
-  if (!response.ok) throw new Error(data.error || `Bridge responded ${response.status}`)
-  return data
+  const route = String(path || '').replace(/^\/+/, '')
+  if (!route) throw new Error('the Google Home bridge route is empty')
+  const request = { method: opts.method || 'GET' }
+  if (opts.body !== undefined) request.body = opts.body
+  if (opts.timeoutMs) request.timeoutMs = opts.timeoutMs
+  try {
+    return await pluginCtx.rest(route, request)
+  } catch (error) {
+    throw new Error(restError(error))
+  }
 }
 
 async function refreshStatus() {
@@ -561,14 +540,6 @@ async function startRecording() {
     say('This Hermes build cannot record audio.')
     return
   }
-  const bridge = typeof window !== 'undefined' ? window.hermesDesktop : null
-  try {
-    if (bridge && typeof bridge.requestMicrophoneAccess === 'function') {
-      await bridge.requestMicrophoneAccess()
-    }
-  } catch {
-    /* the getUserMedia call below is the real gate */
-  }
   let stream
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -619,6 +590,8 @@ async function stopRecording() {
     const dataUrl = await blobToDataUrl(blob)
     const result = await bridgeApi('/listen', {
       method: 'POST',
+      // STT plus a gateway submit can outlast the host's default REST timeout.
+      timeoutMs: 180000,
       body: { data_url: dataUrl, mime_type: blob.type }
     })
     if (result.transcript) {
@@ -1171,7 +1144,7 @@ function BridgePage() {
     hapticTap()
     await loadDevices()
     try {
-      await bridgeApi('/refresh', { method: 'POST', body: {} })
+      await bridgeApi('/refresh', { method: 'POST', body: {}, timeoutMs: 60000 })
     } catch {
       /* refresh is best effort */
     }
@@ -1223,7 +1196,9 @@ function SettingsPage() {
     void loadProfiles()
   }, [])
 
-  const info = control.info
+  // The renderer no longer knows a control port or a control file: the
+  // backend owns that. Report what the bridge itself says instead.
+  const status = statusState && statusState.kind === 'ready' ? statusState.status : null
 
   return jsxs('div', {
     className: 'flex flex-col gap-3',
@@ -1235,9 +1210,11 @@ function SettingsPage() {
         className: 'flex flex-col gap-1 text-xs text-(--ui-text-tertiary)',
         children: [
           jsx('span', {
-            children: info
-              ? `Bridge control API on 127.0.0.1:${info.port} · ${String(info.running ? 'running' : 'stopped')}`
-              : 'Bridge control file not found — start the gateway after installing the agent plugin.'
+            children: status
+              ? `Bridge connected${status.device && status.device.name ? ` · ${status.device.name}` : ''}`
+              : statusState.kind === 'error'
+                ? 'Bridge unreachable — start the Hermes gateway after installing the agent plugin.'
+                : 'Checking the bridge…'
           }),
           jsx('span', { children: 'Discoverable speakers:' }),
           jsx('span', {
@@ -1811,6 +1788,7 @@ export default {
 
   register(ctx) {
     $status.set({ kind: 'idle' })
+    pluginCtx = ctx
     pluginStorage = ctx.storage || null
     $composerHidden.set(readComposerHidden())
 

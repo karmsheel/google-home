@@ -88,7 +88,6 @@ class Settings:
     cron_max_chars: int = DEFAULT_CRON_MAX_CHARS
     control_port: int = DEFAULT_CONTROL_PORT
     media_port: int = 0
-    token_required: bool = True
     speak_replies: bool = True
     speak_cron: bool = True
     # Silence-all switch from the Desktop's status-bar popover. Separate from
@@ -120,6 +119,21 @@ def _first(*candidates: Any, default: Any = None) -> Any:
 _EXTRA_CACHE: dict[str, Any] = {"key": None, "value": {}}
 
 
+def _load_yaml(text: str) -> Any:
+    """Parse YAML with the parser Hermes ships.
+
+    Core does not bundle PyYAML; ``hermes_yaml`` (ruamel, under the same 1.1
+    policy as Hermes config) is always importable in the Hermes process. The
+    PyYAML lookup only keeps a checkout's stdlib-ish test run working outside
+    Hermes; a plugin must never assume that package exists at runtime.
+    """
+    try:
+        from hermes_yaml import safe_load
+    except Exception:  # noqa: BLE001 - not running inside Hermes
+        safe_load = pysite.ensure_import("yaml").safe_load
+    return safe_load(text)
+
+
 def config_file_extra() -> dict[str, Any]:
     """``platforms.googlehome.extra`` from the active profile's config.yaml.
 
@@ -137,14 +151,12 @@ def config_file_extra() -> dict[str, Any]:
     if _EXTRA_CACHE["key"] == key:
         return dict(_EXTRA_CACHE["value"])
     try:
-        yaml = pysite.ensure_import("yaml")
-    except ImportError:  # pragma: no cover - Hermes always ships PyYAML
-        logger.debug("pyyaml unavailable; platforms.googlehome.extra ignored")
-        return {}
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError) as exc:
+        data = _load_yaml(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, ImportError) as exc:
         logger.warning("could not read %s: %s", path, exc)
+        return {}
+    except Exception as exc:  # noqa: BLE001 - a broken YAML parser must not crash a status poll
+        logger.warning("could not parse %s: %s", path, exc)
         return {}
     platforms = data.get("platforms") if isinstance(data, dict) else None
     entry = platforms.get("googlehome") if isinstance(platforms, dict) else None
@@ -191,7 +203,6 @@ def resolve_settings(config: Any = None) -> Settings:
         cron_max_chars=cron_max_chars,
         control_port=control_port,
         media_port=media_port,
-        token_required=_as_bool(pick("token_required"), True),
         speak_replies=_as_bool(pick("speak_replies"), True),
         speak_cron=_as_bool(pick("speak_cron"), True),
         muted=_as_bool(pick("muted"), False),
@@ -203,11 +214,20 @@ def resolve_settings(config: Any = None) -> Settings:
 
 # ── paths ────────────────────────────────────────────────────────────────────
 def hermes_home() -> Path:
-    """The active profile's Hermes home (set by the gateway per profile)."""
-    raw = os.environ.get("HERMES_HOME", "").strip()
-    if raw:
-        return Path(raw)
-    return Path.home() / ".hermes"
+    """The active profile's Hermes home.
+
+    ``hermes_constants.get_hermes_home()`` is the authority: it follows the
+    gateway's context-local profile override (the same one the adapter installs
+    around TTS/STT calls), not just the process-wide ``HERMES_HOME``. The env read
+    is only the fallback for a checkout run without Hermes on the path.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:  # noqa: BLE001 - stdlib tests do not import Hermes core
+        raw = os.environ.get("HERMES_HOME", "").strip()
+        return Path(raw) if raw else Path.home() / ".hermes"
 
 
 def profile_label(home: Optional[Path] = None) -> str:
@@ -222,21 +242,21 @@ _PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 def _root_home() -> Path:
     """The Hermes root that holds ``profiles/``.
 
-    In the supported single-host gateway the process home is the default profile
-    (the root); a ``-p`` CLI process has ``HERMES_HOME`` pointing at
-    ``profiles/<name>``. Both resolve to the same root here.
+    ``hermes_constants.get_default_hermes_root()`` resolves both supported
+    shapes: the default profile (the root itself) and a ``-p`` process whose
+    home is ``profiles/<name>``.
     """
-    raw = os.environ.get("HERMES_HOME", "").strip()
-    if raw:
-        home = Path(raw)
-        if home.parent.name.lower() == "profiles":
-            return home.parent.parent
-        return home
     try:
         from hermes_constants import get_default_hermes_root
 
         return Path(get_default_hermes_root())
     except Exception:  # noqa: BLE001 - stdlib tests do not import Hermes core
+        raw = os.environ.get("HERMES_HOME", "").strip()
+        if raw:
+            home = Path(raw)
+            if home.parent.name.lower() == "profiles":
+                return home.parent.parent
+            return home
         return Path.home() / ".hermes"
 
 
@@ -280,8 +300,7 @@ def _plugin_enabled(home: Path) -> bool:
     """True when ``plugins.enabled`` names googlehome and ``plugins.disabled`` does not."""
     path = Path(home) / "config.yaml"
     try:
-        yaml = pysite.ensure_import("yaml")
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = _load_yaml(path.read_text(encoding="utf-8")) or {}
     except Exception:  # noqa: BLE001 - one broken profile must not 500 the page
         return False
     if not isinstance(data, dict):

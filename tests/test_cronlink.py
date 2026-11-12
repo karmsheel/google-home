@@ -1,12 +1,9 @@
 """Cron wiring: deliver-string rewriting, chat-id resolution, and job patching."""
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -112,88 +109,133 @@ class ChatIdTests(unittest.TestCase):
                              "speaker-default-home")
 
 
-class _FakeCronJobs:
-    """Minimal cron.jobs stand-in: the real module needs the Hermes tree."""
+SAMPLE_LIST = """\
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Scheduled Jobs (profile: default)               │
+└─────────────────────────────────────────────────────────────────────────┘
 
-    def __init__(self, jobs: list[dict]):
-        self.jobs = jobs
-        self.saved: list[dict] | None = None
-        self.used_homes: list = []
+  a1b2c3d4 [active]
+    Name:      Digest
+    Schedule:  35 21 * * *
+    Deliver:   buzz
+    Last run:  2026-11-11T21:36:32  ok
 
-    def load_jobs(self):
-        return [dict(job) for job in self.jobs]
-
-    def save_jobs(self, jobs):
-        self.saved = [dict(job) for job in jobs]
-        self.jobs = [dict(job) for job in jobs]
-
-    @contextlib.contextmanager
-    def use_cron_store(self, home):
-        self.used_homes.append(home)
-        yield
-
-    @contextlib.contextmanager
-    def _jobs_lock(self):
-        yield
+  e5f6a7b8 [paused]
+    Name:      Only local
+    Schedule:  0 9 * * *
+    Deliver:   local,googlehome:speaker-1
+"""
 
 
-class JobPatchingTests(unittest.TestCase):
-    def setUp(self):
-        self.fake = _FakeCronJobs([
-            {"id": "a", "name": "Digest", "deliver": "buzz", "enabled": True},
-            {"id": "b", "name": "Only local", "deliver": "local", "enabled": False},
-        ])
-        cron_pkg = types.ModuleType("cron")
-        cron_pkg.jobs = self.fake
-        self._modules = mock.patch.dict(
-            sys.modules, {"cron": cron_pkg, "cron.jobs": self.fake}
+class ParseJobsTests(unittest.TestCase):
+    """Reading `hermes cron list` instead of the cron store."""
+
+    def test_reads_id_name_deliver_and_state(self):
+        rows = cronlink.parse_jobs(SAMPLE_LIST)
+        self.assertEqual([row["id"] for row in rows], ["a1b2c3d4", "e5f6a7b8"])
+        self.assertEqual(rows[0]["name"], "Digest")
+        self.assertEqual(rows[0]["deliver"], "buzz")
+        self.assertFalse(rows[0]["attached"])
+        self.assertTrue(rows[0]["enabled"])
+        self.assertEqual(rows[1]["name"], "Only local")
+        self.assertEqual(rows[1]["deliver"], "local,googlehome:speaker-1")
+        self.assertTrue(rows[1]["attached"])
+        self.assertFalse(rows[1]["enabled"], "a paused job is not enabled")
+
+    def test_no_jobs_is_an_empty_list(self):
+        self.assertEqual(
+            cronlink.parse_jobs("No scheduled jobs in profile 'default'.\nCreate one ..."),
+            [],
         )
-        self._modules.start()
-        self.addCleanup(self._modules.stop)
+
+    def test_an_unrecognised_listing_is_an_error_not_an_empty_store(self):
+        with self.assertRaises(RuntimeError):
+            cronlink.parse_jobs("some future output shape\n")
+
+    def test_list_jobs_reads_every_job_through_the_cli(self):
+        with mock.patch.object(cronlink, "_run_hermes", return_value=SAMPLE_LIST) as run:
+            rows = cronlink.list_jobs()
+        run.assert_called_once_with(["cron", "list", "--all"], home=None)
+        self.assertEqual(len(rows), 2)
+
+
+class ApplyJobsTests(unittest.TestCase):
+    """Writes go through `hermes cron edit`, never the store."""
+
+    def setUp(self):
+        self.jobs = [
+            {"id": "a", "name": "Digest", "enabled": True, "deliver": "buzz", "attached": False},
+            {"id": "b", "name": "Only local", "enabled": False, "deliver": "local", "attached": False},
+        ]
+        self.edits: list[tuple[str, str]] = []
+
+        def fake_edit(job_id, deliver, *, home=None):
+            self.edits.append((job_id, deliver))
+            return cronlink.edit_command(job_id, deliver)
+
+        self._list = mock.patch.object(
+            cronlink, "list_jobs", side_effect=lambda home=None: [dict(job) for job in self.jobs]
+        )
+        self._edit = mock.patch.object(cronlink, "edit_deliver", side_effect=fake_edit)
+        self._list.start()
+        self._edit.start()
+        self.addCleanup(self._list.stop)
+        self.addCleanup(self._edit.stop)
 
     def test_on_attaches_every_job(self):
         rows = cronlink.apply_jobs("on", "speaker-1")
         self.assertEqual([row["changed"] for row in rows], [True, True])
-        self.assertEqual(self.fake.jobs[0]["deliver"], "buzz,googlehome:speaker-1")
-        self.assertEqual(self.fake.jobs[1]["deliver"], "googlehome:speaker-1")
-        self.assertIsNotNone(self.fake.saved)
+        self.assertEqual(self.edits, [
+            ("a", "buzz,googlehome:speaker-1"),
+            ("b", "googlehome:speaker-1"),
+        ])
+        self.assertEqual(
+            rows[0]["command"], "hermes cron edit a --deliver buzz,googlehome:speaker-1"
+        )
 
     def test_on_is_idempotent(self):
-        cronlink.apply_jobs("on", "speaker-1")
-        self.fake.saved = None
+        self.jobs[0]["deliver"] = "buzz,googlehome:speaker-1"
+        self.jobs[1]["deliver"] = "googlehome:speaker-1"
         rows = cronlink.apply_jobs("on", "speaker-1")
         self.assertFalse(any(row["changed"] for row in rows))
-        self.assertIsNone(self.fake.saved, "no write when nothing changed")
+        self.assertEqual(self.edits, [], "no edit command when nothing changed")
 
     def test_off_restores_local_for_speaker_only_jobs(self):
-        cronlink.apply_jobs("on", "speaker-1")
-        rows = cronlink.apply_jobs("off", "speaker-1")
-        self.assertEqual(self.fake.jobs[0]["deliver"], "buzz")
-        self.assertEqual(self.fake.jobs[1]["deliver"], "local")
-        self.assertTrue(all(row["changed"] for row in rows))
+        self.jobs[0]["deliver"] = "buzz,googlehome:speaker-1"
+        self.jobs[1]["deliver"] = "googlehome:speaker-1"
+        cronlink.apply_jobs("off", "speaker-1")
+        self.assertEqual(self.edits, [("a", "buzz"), ("b", "local")])
 
-    def test_dry_run_does_not_write(self):
+    def test_dry_run_prints_instead_of_writing(self):
         rows = cronlink.apply_jobs("on", "speaker-1", dry_run=True)
         self.assertTrue(any(row["changed"] for row in rows))
-        self.assertEqual(self.fake.jobs[0]["deliver"], "buzz")
-        self.assertIsNone(self.fake.saved)
+        self.assertEqual(self.edits, [])
+        self.assertEqual(
+            rows[1]["command"], "hermes cron edit b --deliver googlehome:speaker-1"
+        )
 
-    def test_list_jobs_reports_attach_state(self):
-        cronlink.apply_jobs("on", "speaker-1")
-        rows = cronlink.list_jobs()
-        self.assertTrue(all(row["attached"] for row in rows))
-        self.assertEqual(rows[0]["deliver"], "buzz,googlehome:speaker-1")
-        self.assertEqual(rows[0]["failure_deliver"], "",
-                         "an unset failure lane follows deliver; it is not 'local'")
 
-    def test_home_routes_the_store(self):
+class EditCommandTests(unittest.TestCase):
+    def test_home_routes_the_cli(self):
         home = Path("profiles") / "researcher"
-        cronlink.apply_jobs("on", "speaker-1", home=home)
-        self.assertEqual(self.fake.used_homes, [home])
+        with mock.patch.object(cronlink, "_run_hermes", return_value="") as run:
+            cronlink.edit_deliver("a", "buzz", home=home)
+        run.assert_called_once_with(["cron", "edit", "a", "--deliver", "buzz"], home=home)
 
-    def test_default_store_is_not_redirected(self):
-        cronlink.list_jobs()
-        self.assertEqual(self.fake.used_homes, [])
+    def test_the_displayed_command_is_the_public_one(self):
+        self.assertEqual(
+            cronlink.edit_command("a1b2", "buzz,googlehome:speaker-1"),
+            "hermes cron edit a1b2 --deliver buzz,googlehome:speaker-1",
+        )
+
+    def test_a_failed_edit_is_a_readable_error(self):
+        failed = mock.Mock(returncode=1, stdout="", stderr="Job not found: a\n")
+        with mock.patch.object(cronlink, "hermes_command", return_value=["hermes"]), \
+             mock.patch.object(cronlink.subprocess, "run", return_value=failed):
+            with self.assertRaises(RuntimeError) as raised:
+                cronlink.edit_deliver("a", "buzz")
+        self.assertIn("Job not found", str(raised.exception))
+        self.assertIn("cron edit", str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -363,20 +363,24 @@ class ControlReplyEndpointTests(unittest.TestCase):
     def setUp(self):
         self.adapter = _LoopAdapter()
         self.addCleanup(self.adapter.close)
-        self.server = control_module.ControlServer(self.adapter, port=0, token="")
+        self.token = "test-token"
+        self.server = control_module.ControlServer(self.adapter, port=0, token=self.token)
         self.server.start()
         self.addCleanup(self.server.stop)
         self.base = f"http://127.0.0.1:{self.server.port}"
 
     def _get(self, path: str) -> dict:
-        with urllib.request.urlopen(self.base + path, timeout=5) as response:
+        request = urllib.request.Request(
+            self.base + path, headers={"X-Hermes-Token": self.token}
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def test_ask_returns_a_token_and_reply_serves_the_text(self):
         request = urllib.request.Request(
             self.base + "/ask",
             data=json.dumps({"text": "hello"}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Hermes-Token": self.token},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=5) as response:
@@ -412,7 +416,8 @@ class ControlMuteEndpointTests(unittest.TestCase):
     def setUp(self):
         self.adapter = _LoopAdapter()
         self.addCleanup(self.adapter.close)
-        self.server = control_module.ControlServer(self.adapter, port=0, token="")
+        self.token = "test-token"
+        self.server = control_module.ControlServer(self.adapter, port=0, token=self.token)
         self.server.start()
         self.addCleanup(self.server.stop)
         self.base = f"http://127.0.0.1:{self.server.port}"
@@ -421,7 +426,7 @@ class ControlMuteEndpointTests(unittest.TestCase):
         request = urllib.request.Request(
             self.base + path,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Hermes-Token": self.token},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=5) as response:

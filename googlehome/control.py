@@ -4,13 +4,18 @@ The adapter lives inside the gateway process, which is where a turn must be
 injected and where the Cast session lives. The Desktop extension therefore
 needs a door into *that* process; this is it. It binds 127.0.0.1 only and
 requires the per-install token that ``config.ensure_token()`` writes to
-``control-token`` (and mirrors into ``control.json`` so the Desktop plugin can
-find both the port and the token).
+``control-token`` (the Desktop backend reads it from ``control.json`` and
+proxies through ``/api/plugins/googlehome`` — the renderer never sees either).
+
+The token is required on every request, only in the ``X-Hermes-Token`` header,
+compared in constant time. The Host header must name this bound port, and no
+CORS headers are sent: a local page cannot reach the API from a browser.
 
 Endpoints
 ---------
 GET  /status     adapter + device state
-GET  /reply      ?token=...  the reply a Desktop turn produced (poll it)
+GET  /reply      ?token=...  the reply a Desktop turn produced (this is the
+                             turn's capture token, not the API token; poll it)
 GET  /playback   audible audio + replies that were not spoken (cheap; no Cast IO)
 GET  /devices    mDNS discovery results
 GET  /profiles   bridge owner + which profiles have this plugin enabled
@@ -28,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hmac
 import json
 import logging
 import threading
@@ -73,6 +79,9 @@ class ControlServer:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> int:
+        if not self.token:
+            logger.warning("[googlehome] control API started without a token; "
+                           "every request will be refused")
         handler = _make_handler(self)
         last_error: Optional[Exception] = None
         for offset in range(0, 11):
@@ -90,8 +99,9 @@ class ControlServer:
             self._thread = threading.Thread(target=httpd.serve_forever,
                                             name="gh-control", daemon=True)
             self._thread.start()
-            logger.info("[googlehome] control API on http://127.0.0.1:%s", port)
-            return port
+            bound = httpd.server_port
+            logger.info("[googlehome] control API on http://127.0.0.1:%s", bound)
+            return bound
         raise last_error or OSError("could not bind the control port")
 
     def stop(self) -> None:
@@ -115,16 +125,19 @@ class ControlServer:
         return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
 
     def authorized(self, handler: BaseHTTPRequestHandler) -> bool:
+        """True only for the exact per-install token in ``X-Hermes-Token``.
+
+        This platform skips pairing, so this header is the whole authentication
+        story: there is no token-less mode and no query-string spelling (a URL
+        token leaks into logs, history and referrers). A missing install token
+        fails closed rather than opening the door.
+        """
         if not self.token:
-            return True
+            return False
         supplied = handler.headers.get("X-Hermes-Token", "")
         if not supplied:
-            query = handler.path.split("?", 1)[1] if "?" in handler.path else ""
-            for pair in query.split("&"):
-                if pair.startswith("token="):
-                    supplied = pair[len("token="):]
-                    break
-        return supplied == self.token
+            return False
+        return hmac.compare_digest(supplied, self.token)
 
 
 def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
@@ -140,18 +153,12 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
         def log_message(self, fmt: str, *args) -> None:  # noqa: A003
             logger.debug("control: " + fmt, *args)
 
-        def _cors(self) -> None:
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Hermes-Token")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-
         def _reply(self, status: int, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, default=str).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            self._cors()
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -160,6 +167,21 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
 
         def _error(self, status: int, message: str) -> None:
             self._reply(status, {"ok": False, "error": message})
+
+        def _host_allowed(self) -> bool:
+            """Only the loopback names this server is bound to may address it.
+
+            The token stops other local users; the Host check stops a browser on
+            this machine from being used as a DNS-rebinding proxy into the API
+            (a page on ``evil.example`` resolving to 127.0.0.1 still sends its
+            own Host header). The port must be the bound one, so a second
+            listener on another port cannot forward here either.
+            """
+            raw = (self.headers.get("Host") or "").strip().lower()
+            port = int(self.control.port or 0)
+            if not raw or not port:
+                return False
+            return raw in {f"127.0.0.1:{port}", f"localhost:{port}"}
 
         def _body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length") or 0)
@@ -179,18 +201,15 @@ def _make_handler(server_ref: Any) -> type[BaseHTTPRequestHandler]:
                 raise ValueError(f"invalid JSON body: {exc}") from exc
 
         def _guard(self) -> bool:
+            if not self._host_allowed():
+                self._error(HTTPStatus.FORBIDDEN, "invalid Host header")
+                return False
             if not self.control.authorized(self):
                 self._error(HTTPStatus.UNAUTHORIZED, "missing or invalid X-Hermes-Token")
                 return False
             return True
 
         # ── verbs ───────────────────────────────────────────────────────────
-        def do_OPTIONS(self) -> None:  # noqa: N802
-            self.send_response(HTTPStatus.NO_CONTENT)
-            self.send_header("Content-Length", "0")
-            self._cors()
-            self.end_headers()
-
         def do_GET(self) -> None:  # noqa: N802
             if not self._guard():
                 return

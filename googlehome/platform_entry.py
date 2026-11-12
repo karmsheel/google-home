@@ -62,7 +62,7 @@ def build_platform_kwargs(*, ctx: Any, adapter: Any, check_fn: Any, validate_con
             "Speak through a Google Home / Nest speaker. Replies from the bound "
             "profile are synthesized and cast to the device."
         ),
-        "docs_url": "https://github.com/NousResearch/hermes-agent",
+        "docs_url": "https://github.com/karmsheel/google-home",
         "pii_safe": True,
         # Cron reads this env var when a job's ``deliver`` names this platform
         # without a chat id. The helper writes explicit targets instead (one

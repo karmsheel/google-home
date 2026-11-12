@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 PLUGIN_NAME = "googlehome"
 PLATFORM_NAME = "googlehome"
 __all__ = ["register", "PLUGIN_NAME", "PLATFORM_NAME", "__version__"]

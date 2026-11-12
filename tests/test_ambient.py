@@ -161,7 +161,8 @@ class PlaybackNoticeEndpointTests(unittest.TestCase):
         self.env.start()
         from googlehome import control as control_module
 
-        self.server = control_module.ControlServer(mock.Mock(), port=0, token="")
+        self.token = "test-token"
+        self.server = control_module.ControlServer(mock.Mock(), port=0, token=self.token)
         self.server.start()
         self.addCleanup(self.server.stop)
         self.base = f"http://127.0.0.1:{self.server.port}"
@@ -171,7 +172,10 @@ class PlaybackNoticeEndpointTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _get(self, path: str) -> dict:
-        with urllib.request.urlopen(self.base + path, timeout=5) as response:
+        request = urllib.request.Request(
+            self.base + path, headers={"X-Hermes-Token": self.token}
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def test_playback_poll_carries_unspoken_replies(self):

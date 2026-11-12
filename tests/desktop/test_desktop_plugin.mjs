@@ -56,6 +56,24 @@ check('no JSX syntax', () => {
   assert.equal(/<[A-Z][A-Za-z0-9]*[\s/>]/.test(source), false, 'JSX is a syntax error in a runtime plugin')
 })
 
+check('the renderer has no direct bridge transport', () => {
+  // ctx.rest is the only door: the backend owns control.json and the token.
+  for (const forbidden of [
+    'hermesDesktop',
+    'readFileText',
+    'requestMicrophoneAccess',
+    'control.json',
+    'X-Hermes-Token',
+    'fetch('
+  ]) {
+    assert.equal(
+      source.includes(forbidden),
+      false,
+      `plugin.js must not use ${forbidden}; call ctx.rest instead`
+    )
+  }
+})
+
 check('single default-exported plugin object', () => {
   assert.match(source, /export default\s*\{/)
 })
@@ -115,6 +133,52 @@ const settingsPages = []
 const disposers = []
 // Plugin-scoped persistence, mirroring the host's namespaced store.
 const storage = new Map()
+
+// ── the backend the plugin reaches through ctx.rest ──────────────────────────
+// `ctx.rest` is the plugin's own namespace (/api/plugins/googlehome/…); the
+// Python plugin_api.py proxies to the bridge. The harness answers that door,
+// so plugin.js must not know a port, a token, or a file path.
+let replyPolls = 0
+let failNextAsk = null
+let profilesResponse = {
+  ok: true,
+  bridge_profile: 'default',
+  plugin_profiles: ['default', 'coder']
+}
+// What the control API answers on the poll that also carries unspoken replies.
+let playbackResponse = { ok: true, speaking: false, notices: [] }
+const bridgeCalls = []
+
+function bridgeResponse(rawPath, options) {
+  const opts = options || {}
+  const path = '/' + String(rawPath || '').replace(/^\/+/, '')
+  bridgeCalls.push(path)
+  let body = { ok: true }
+  if (path.startsWith('/ask')) {
+    if (failNextAsk) {
+      body = { ok: true, submitted: false, error: failNextAsk }
+      failNextAsk = null
+    } else {
+      body = { ok: true, submitted: true, token: 'turn-1', text: 'hello' }
+    }
+  } else if (path.startsWith('/reply')) {
+    replyPolls += 1
+    body =
+      replyPolls < 2
+        ? { ok: true, done: false, reply: '', error: '' }
+        : { ok: true, done: true, reply: 'Hello from the speaker.', error: '' }
+  } else if (path.startsWith('/profiles')) {
+    body = profilesResponse
+  } else if (path.startsWith('/playback')) {
+    body = playbackResponse
+  }
+  if (opts.body !== undefined && opts.method === 'POST') {
+    // A POST must reach the backend as a body, not a query string.
+    assert.equal(typeof opts.body, 'object', `POST ${path} needs a JSON body`)
+  }
+  return body
+}
+
 const ctx = {
   storage: {
     get: (_key, fallback) => (storage.has(_key) ? storage.get(_key) : fallback),
@@ -151,7 +215,7 @@ const ctx = {
   addEventListener() {
     return () => {}
   },
-  rest: async () => ({}),
+  rest: (path, options) => bridgeResponse(path, options),
   socket: () => () => {},
   os: {},
   i18n: {},
@@ -393,51 +457,6 @@ async function until(predicate, timeoutMs = 8000) {
     await new Promise(resolve => setTimeout(resolve, 40))
   }
   return false
-}
-
-// The page against a control API that answers a turn with a reply.
-let replyPolls = 0
-let failNextAsk = null
-let profilesResponse = {
-  ok: true,
-  bridge_profile: 'default',
-  plugin_profiles: ['default', 'coder']
-}
-// What the control API answers on the poll that also carries unspoken replies.
-let playbackResponse = { ok: true, speaking: false, notices: [] }
-const bridgeCalls = []
-globalThis.window = {
-  hermesDesktop: {
-    desktopPluginsRoot: async () => '/tmp/desktop-plugins',
-    readFileText: async () => ({
-      text: JSON.stringify({ port: 43210, token: 'test-token' }),
-      truncated: false
-    })
-  }
-}
-globalThis.fetch = async (url, init) => {
-  const path = String(url).replace(/^https?:\/\/[^/]+/, '')
-  bridgeCalls.push(path)
-  let body = { ok: true }
-  if (path.startsWith('/ask')) {
-    if (failNextAsk) {
-      body = { ok: true, submitted: false, error: failNextAsk }
-      failNextAsk = null
-    } else {
-      body = { ok: true, submitted: true, token: 'turn-1', text: 'hello' }
-    }
-  } else if (path.startsWith('/reply')) {
-    replyPolls += 1
-    body =
-      replyPolls < 2
-        ? { ok: true, done: false, reply: '', error: '' }
-        : { ok: true, done: true, reply: 'Hello from the speaker.', error: '' }
-  } else if (path.startsWith('/profiles')) {
-    body = profilesResponse
-  } else if (path.startsWith('/playback')) {
-    body = playbackResponse
-  }
-  return { ok: true, status: 200, json: async () => body }
 }
 
 await new Promise(resolve => setTimeout(resolve, 80))

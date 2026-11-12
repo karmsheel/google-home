@@ -127,15 +127,30 @@ class AdapterProfileScopeTests(unittest.TestCase):
         """TTS credentials must use the profile that actually answers."""
         from unittest import mock
 
-        from hermes_cli import profiles as profile_module
+        import hermes_constants
 
         adapter = GoogleHomeAdapter.__new__(GoogleHomeAdapter)
         adapter.settings = type("Settings", (), {"profile": "coder"})()
         adapter.effective_profile = lambda: "researcher"
         routed = Path(self.host.home) / "profiles" / "researcher"
-        with mock.patch.object(profile_module, "profile_exists", return_value=True), \
-             mock.patch.object(profile_module, "get_profile_dir", return_value=routed):
+        with mock.patch.object(hermes_constants, "get_default_hermes_root",
+                               return_value=self.host.home), \
+             mock.patch.object(hermes_constants, "named_profile_home", return_value=routed), \
+             mock.patch.object(hermes_constants, "named_profile_is_live", return_value=True):
             self.assertEqual(adapter._profile_home(), routed)
+
+    def test_default_route_uses_the_root_not_the_active_profile(self):
+        """A routed "default" means the root home, even from a -p process."""
+        from unittest import mock
+
+        import hermes_constants
+
+        adapter = GoogleHomeAdapter.__new__(GoogleHomeAdapter)
+        adapter.settings = type("Settings", (), {"profile": ""})()
+        adapter.effective_profile = lambda: "default"
+        with mock.patch.object(hermes_constants, "get_default_hermes_root",
+                               return_value=self.host.home):
+            self.assertEqual(adapter._profile_home(), self.host.home)
 
     def test_synthesize_runs_inside_the_scope(self):
         """`_synthesize` is what `send()` actually calls on a worker thread."""

@@ -9,12 +9,15 @@ is synthesized by Hermes and cast over the Cast v2 protocol, after mDNS
 discovery and a TLS 8009 handshake. The speaker's own microphone is not
 reachable by third parties and is not used.
 
-This directory is the installable plugin. It contains both halves:
+This directory is the installable plugin. It contains all three pieces:
 
 - **the platform adapter** (Python, standard library only): `kind: platform`,
   five tools, two hooks, and `hermes googlehome` CLI commands;
 - **the Desktop extension** (`desktop/plugin.js`): a page, a sidebar row, a
-  status-bar chip with volume and mute, palette commands, and push-to-talk.
+  status-bar chip with volume and mute, palette commands, and push-to-talk;
+- **the Desktop backend** (`dashboard/plugin_api.py`): a small router the
+  gateway mounts at `/api/plugins/googlehome`, which proxies the adapter's
+  loopback API so the page never reads `control.json` or holds its token.
 
 Full documentation — architecture, protocol notes, troubleshooting — is in the
 [repository README](../README.md) and
@@ -65,6 +68,11 @@ Copy-Item .\googlehome\desktop\plugin.js "$env:LOCALAPPDATA\hermes\desktop-plugi
 
 Reload it from the Desktop (Ctrl+K → **Reload desktop plugins**). The folder
 name must equal the plugin id, `googlehome`.
+
+The backend half needs no copy: it ships with the agent plugin and is mounted
+by the gateway (restart the gateway after installing). The page talks to it
+with `ctx.rest`; if it is missing, the page says the backend is not loaded and
+the gateway log names the import failure.
 
 ### Firewall
 
@@ -130,9 +138,11 @@ Disclosure, for a network you care about:
 - **A media server on every interface.** It serves only the clip directory,
   without authentication — the speaker has no way to send a credential. Pin the
   port and scope it with the firewall rule above.
-- **A loopback control API.** `127.0.0.1` only, gated by the `X-Hermes-Token`
-  from `control.json`. It can start turns, accept recorded audio, set volume,
-  mute, and stop playback. It is the Desktop extension's only door.
+- **A loopback control API.** `127.0.0.1` only. Every request needs the
+  per-install `X-Hermes-Token` (header only), the Host header must name the
+  bound loopback port, and no CORS grant is sent. It can start turns, accept
+  recorded audio, set volume, mute, and stop playback. The Desktop page reaches
+  it through the `/api/plugins/googlehome` backend, never directly.
 - **Subprocesses for speech.** Windows SAPI runs through `powershell` (offline);
   `edge-tts` is used only when that backend is chosen and calls Microsoft's
   cloud.
@@ -143,8 +153,10 @@ Disclosure, for a network you care about:
 ## Requirements
 
 - Hermes Agent `>=0.21.5` (declared in `plugin.yaml` as `requires_hermes`).
-- Python standard library only — no Cast SDK, no protobuf package, no
-  third-party dependency.
+- Python standard library only for the agent half — no Cast SDK, no protobuf
+  package, no third-party dependency. YAML is read with the `hermes_yaml` that
+  core ships. The Desktop backend uses FastAPI, which the Hermes plugin host
+  already provides.
 - A speech backend: Hermes TTS with a working provider, the offline Windows SAPI
   engine, or `edge-tts`. A missing backend is reported in the UI, never raised
   into the chat.

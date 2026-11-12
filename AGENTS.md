@@ -5,14 +5,17 @@
 `google-home` is a **Hermes Agent plug-in** that puts a Google Home / Nest
 speaker on the other end of a Hermes profile's conversation.
 
-It has two surfaces in one package:
+It has three surfaces in one package:
 
 - **`googlehome/`** — the Python plug-in: a `kind: platform` gateway adapter that
   synthesizes replies, casts them over the Cast v2 protocol, accepts voice from
   the host microphone, and exposes five tools.
+- **`googlehome/dashboard/plugin_api.py`** — the Desktop backend the gateway
+  mounts at `/api/plugins/googlehome`; it proxies the adapter's loopback control
+  API, so the page never reads `control.json` or holds its token.
 - **`googlehome/desktop/plugin.js`** — the Hermes Desktop extension: a page, a
   sidebar row, a status-bar chip, palette commands, push-to-talk, and settings.
-  It is a thin client of the adapter's loopback control API.
+  It is a thin client of the backend above, through `ctx.rest`.
 
 There is **one project and one plug-in**. `googlehome-mini` was a second,
 Node-based take on the same idea; it has been retired and its useful parts live
@@ -61,6 +64,7 @@ It never names a project, package, plug-in, module, or setting.
 | `googlehome/__init__.py` | `register(ctx)`: platform, tools, CLI. Defers core imports. |
 | `googlehome/adapter.py` | The platform adapter: connect, cast, `send()`, voice turns, profile binding. |
 | `googlehome/control.py` | Loopback HTTP API (`/status`, `/profiles`, `/reply`, `/playback`, `/devices`, `/ask`, `/speak`, `/stop`, `/listen`, `/device`, `/profile`, `/volume`, `/mute`, `/destination`). |
+| `googlehome/dashboard/plugin_api.py` | Desktop backend at `/api/plugins/googlehome`: proxies the loopback API so the renderer never holds the token. |
 | `googlehome/playback.py` | In-process registry of audible clips; the stop hooks and the `/playback` snapshot. |
 | `googlehome/ambient.py` | Per-conversation destinations chosen in the composer, and the turn-end hook that speaks them. |
 | `googlehome/tools.py` | The five tools the model can call. |
@@ -71,16 +75,16 @@ It never names a project, package, plug-in, module, or setting.
 | `googlehome/castdevice.py`, `castproto.py` | Cast v2 over TLS 8009 and its protobuf envelope. |
 | `googlehome/discovery.py` | mDNS discovery and device normalisation. |
 | `googlehome/audioserver.py` | HTTP server the speaker fetches the MP3 from. |
-| `googlehome/cronlink.py` | Speaks a short digest of cron deliveries. |
+| `googlehome/cronlink.py` | Speaks a short digest of cron deliveries; attaches/removes the target with `hermes cron list` / `hermes cron edit`. |
 | `googlehome/platform_entry.py` | `PlatformEntry` kwargs, feature-detected. |
 | `googlehome/desktop/plugin.js` | Hermes Desktop extension (single uncompiled file). |
 | `docs/REVERSE_ENGINEERING.md` | Protocol findings; why speaker-in is impossible. |
-| `tests/` | 294 stdlib tests (56 need Hermes core); `tests/desktop/` is the plugin.js harness. |
+| `tests/` | 309 stdlib tests (54 need Hermes core); `tests/desktop/` is the plugin.js harness. |
 
 ## How a turn becomes speech
 
 ```text
-Desktop (push-to-talk) ──POST /listen──▶ control API ──▶ adapter.submit_audio
+Desktop (push-to-talk) ──ctx.rest──▶ plugin_api ──POST /listen──▶ control API ──▶ adapter.submit_audio
                                                           │ STT
                                                           ▼
                                                     Hermes turn (profile)
@@ -102,9 +106,19 @@ Long task, "notify me on the living room speaker when done":
 
 ## Invariants worth preserving
 
-- **The control API is loopback-only and token-gated** (`X-Hermes-Token` from
-  `control-token`, mirrored into `control.json`). It can run turns; never widen
-  the bind address or drop the token.
+- **The control API is loopback-only and always token-gated.** The token lives in
+  `control-token`, mirrored into `control.json` (mode 0600) for the plugin's own
+  backend; the API accepts it only in `X-Hermes-Token`, compares with
+  `hmac.compare_digest`, rejects a Host other than the bound
+  `127.0.0.1:<port>`/`localhost:<port>`, and sends no CORS headers. It can run
+  turns; never widen the bind address, add a query-string token, or drop the
+  token. The Desktop page reaches it through `dashboard/plugin_api.py` with
+  `ctx.rest`; the renderer never reads `control.json` or calls the port itself.
+- **Plugins use public surfaces only.** The adapter does not read session-store
+  internals (core self-heals a deleted route), and cron wiring goes through
+  `hermes cron list` / `hermes cron edit` rather than `cron.jobs` or its lock.
+  Core ships `hermes_yaml`, not PyYAML; profile paths come from
+  `hermes_constants`, not `hermes_cli.profiles`.
 - **The page can see its own turn.** `/ask` and `/listen` return a token and the
   adapter records the reply (or the failure) under it; `/reply?token=…` serves it.
   Captures expire (15 min, bounded count). Without this the speaker is the only
@@ -198,8 +212,8 @@ Long task, "notify me on the living room speaker when done":
 ## Working on it
 
 ```powershell
-python -m unittest discover -s tests -t .        # 294 stdlib tests
-node tests/desktop/test_desktop_plugin.mjs       # plugin.js loader/render/behaviour harness
+python -m unittest discover -s tests -t .        # 309 stdlib tests
+node tests/desktop/test_desktop_plugin.mjs       # 38 plugin.js loader/render/behaviour checks
 hermes plugins doctor googlehome                 # manifest, import, register
 hermes googlehome check                          # speaker reachability
 hermes googlehome devices                        # mDNS scan
@@ -220,6 +234,9 @@ hermes plugins enable googlehome
 The Desktop half is a **copy**: `googlehome/desktop/plugin.js` must be copied to
 `$env:HERMES_HOME\desktop-plugins\googlehome\plugin.js`, then reloaded from the
 Desktop (Ctrl+K → Reload desktop plugins). The Desktop never reads this
-directory.
+directory. The backend half (`googlehome/dashboard/`) ships with the agent
+plugin and is mounted by the gateway at `/api/plugins/googlehome`; it needs no
+copy, but the gateway must be restarted after the plugin is (re)installed.
 
 See `README.md` for install, settings, and troubleshooting.
+

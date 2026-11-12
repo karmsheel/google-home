@@ -36,8 +36,12 @@ for these speakers.
 ┌──────────────── Hermes Desktop ────────────────┐
 │ push-to-talk  →  MediaRecorder → base64        │
 └───────────────────────┬────────────────────────┘
+                        │  ctx.rest('/listen') → /api/plugins/googlehome
+┌───────────────────────▼────────────────────────┐
+│ web-server process: dashboard/plugin_api.py    │
+│   reads control.json, adds X-Hermes-Token      │
+└───────────────────────┬────────────────────────┘
                         │  POST http://127.0.0.1:<port>/listen
-                        │  (X-Hermes-Token, from control.json)
 ┌───────────────────────▼────────────────────────┐
 │ gateway process                                │
 │  googlehome adapter                            │
@@ -60,9 +64,12 @@ Two details that matter:
   Hermes like any other chat. On current Hermes the gateway also wants the route
   declared (`gateway.profile_routes`), because the session authority keys the
   turn on it; see *Install* below.
-- **The Desktop half needs a loopback door.** The adapter writes
-  `<HERMES_HOME>/googlehome/control.json` with `{port, token}`; the extension
-  reads it through the Electron bridge and talks to that port.
+- **The Desktop half reaches the bridge through its own backend.** The adapter
+  writes `<HERMES_HOME>/googlehome/control.json` with `{port, token}`; the
+  package's `dashboard/plugin_api.py` (mounted at `/api/plugins/googlehome`)
+  reads it and proxies, and the renderer only ever calls `ctx.rest`. The
+  renderer never sees the port or the token, and a Desktop attached to a remote
+  Hermes does not need the gateway's disk.
 
 ## What it touches
 
@@ -73,9 +80,11 @@ Disclosure, for anyone installing this on a network they care about:
 - **A media server on every interface.** The pinned media port (`8766`) serves
   only the clip directory, without authentication — the speaker has no way to
   send a credential. Scope it with the firewall rule in *Install*.
-- **A loopback control API.** `127.0.0.1` only, gated by the `X-Hermes-Token`
-  from `control.json`. It can start turns, accept recorded audio, set volume,
-  mute, and stop playback. It is the Desktop extension's only door.
+- **A loopback control API.** `127.0.0.1` only. Every request needs the
+  per-install `X-Hermes-Token` (header only), the Host header must name the
+  bound loopback port, and no CORS grant is sent. It can start turns, accept
+  recorded audio, set volume, mute, and stop playback. The Desktop extension
+  reaches it through its own `/api/plugins/googlehome` backend, never directly.
 - **Subprocesses for speech.** Windows SAPI runs through `powershell` (offline);
   `edge-tts` is used only when you pick that backend and calls Microsoft's cloud.
 - **No credentials and no telemetry.** No environment variables, no third-party
@@ -158,7 +167,7 @@ hermes config set platforms.googlehome.extra.device 192.168.1.42
 
 ### 2. Desktop extension
 
-Copied (no build step — it is plain ESM, loaded uncompiled):
+The page is copied (no build step — it is plain ESM, loaded uncompiled):
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\hermes\desktop-plugins\googlehome"
@@ -167,6 +176,11 @@ Copy-Item .\googlehome\desktop\plugin.js "$env:LOCALAPPDATA\hermes\desktop-plugi
 
 The folder name must equal the plugin id (`googlehome`). It hot-reloads on save;
 ⌘K → "Reload desktop plugins" forces it.
+
+Its backend — `googlehome/dashboard/plugin_api.py`, mounted by the gateway at
+`/api/plugins/googlehome` — ships inside the agent plugin from step 1. Nothing
+extra is copied: the page calls that backend with `ctx.rest`, and the backend
+is the only thing that reads `control.json`.
 
 ### 3. Firewall (required)
 
@@ -271,7 +285,8 @@ hermes googlehome firewall        # open the media port (UAC prompt)
   | `googlehome_volume` | set device volume 0–100 |
   | `googlehome_devices` | list Cast devices on the LAN |
 
-- **Local API** (same port as above, token required):
+- **Local API** (same port as above; the Desktop reaches it through
+  `/api/plugins/googlehome`, which adds the token — the renderer never holds it):
 
   ```
   GET  /status      GET  /devices      GET  /info
@@ -290,6 +305,10 @@ hermes googlehome firewall        # open the media port (UAC prompt)
   GET  /destination?session=<id>
   POST /destination {"session": "…", "mode": "off|speaker", "device": "…", "name": "…"}
   ```
+
+  Every request must send `X-Hermes-Token`; the API also rejects a Host header
+  other than the bound `127.0.0.1:<port>`/`localhost:<port>` and sends no CORS
+  headers, so a page on this machine cannot drive the speaker.
 
   `GET /profiles` reports the profile that hosts the bridge and the profiles
   where this plugin is installed and enabled. The page uses it for the
@@ -440,10 +459,12 @@ hermes googlehome cron on --cron-profile researcher
 hermes googlehome cron status --cron-profile researcher
 ```
 
-`on`/`off` rewrite each job's `deliver` list under the cron store's own lock;
-`--dry-run` prints the plan, `--chat-id` overrides the target. A job whose only
-target was `local` ends up with just the speaker; `off` returns it to `local`.
-The output file is written either way.
+`on`/`off` read the job list with `hermes cron list` and update each job with
+`hermes cron edit <id> --deliver <target>` — public commands, so the plugin
+never opens `jobs.json` or takes the scheduler's store lock. `--dry-run` prints
+those commands instead of running them, `--chat-id` overrides the target. A job
+whose only target was `local` ends up with just the speaker; `off` returns it to
+`local`. The output file is written either way.
 
 For one job instead of all of them:
 
@@ -583,7 +604,8 @@ Two things worth knowing:
 | `device found … but not answering` | Something is on 8009 but not a healthy receiver; power-cycle it. |
 | Reply cast, silence after 1–2 s | The media server is unreachable: firewall, or wrong local IP (`media.stats.last_request_at` stale). |
 | `No TTS provider is configured` | Hermes TTS has no usable provider. `auto` should fall back to the Windows engine; check `speech.last_backend` in `hermes googlehome status`, or pin `speech_backend: sapi`. |
-| Desktop page says bridge not connected | Gateway not running, or `control.json` missing: check `<HERMES_HOME>/googlehome/control.json`. |
+| Desktop page says bridge not connected | Gateway not running, or the backend cannot find `control.json`: start the gateway, then check `<HERMES_HOME>/googlehome/control.json`. The renderer itself no longer reads that file. |
+| Desktop page says the backend is not loaded | The `dashboard/plugin_api.py` half is missing or the plugin is disabled for this profile. Reinstall/link the whole package, enable the plugin, then restart the gateway (or reload desktop plugins). |
 | `RuntimeStoreError('profile_mismatch')` | Declare the route: `hermes config set gateway.profile_routes '[{"platform":"googlehome","profile":"coder"}]'`. A plugin-side `SessionSource.profile` stamp alone does not move the session authority. |
 | The speaker reads the model's reasoning | `display.show_reasoning` is on globally. Set the per-platform override: `hermes config set display.platforms.googlehome.show_reasoning false` (already set here). The bridge also strips a leading rendered reasoning block before speech, so nothing is read aloud even without the override. |
 | Reply is a pairing code | The platform should be registered as `trusted_inbound` (it is, from this version): every inbound turn comes from the plugin's own token-gated loopback API, so the allowlist/pairing gate does not apply. On an older plugin, approve the sender once: `hermes -p <profile> pairing approve googlehome <CODE>`. |
@@ -602,11 +624,11 @@ Two things worth knowing:
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -t .                    # 276 tests; adapter tests skip without core
+python -m unittest discover -s tests -t .                    # 309 tests; adapter tests skip without core
 $env:PYTHONPATH="$env:LOCALAPPDATA\hermes\hermes-agent"
 & "$env:LOCALAPPDATA\hermes\hermes-agent\.venv\Scripts\python.exe" `
-  -m unittest tests.test_adapter_integration tests.test_reply_capture   # need Hermes core
-node tests/desktop/test_desktop_plugin.mjs                   # 36 loader/render/behaviour checks
+  -m unittest tests.test_adapter_integration tests.test_reply_capture tests.test_dashboard_api
+node tests/desktop/test_desktop_plugin.mjs                   # 38 loader/render/behaviour checks
 ```
 
 The Cast protocol is verified against `tests/mock_cast_device.py`, a TLS endpoint
@@ -627,6 +649,10 @@ googlehome/                 the installable plugin
   cronlink.py               cron deliver-list wiring for ``hermes googlehome cron``
   pysite.py                 import repair for launchers that strip site-packages
   control.py                loopback control API for the Desktop extension
+  dashboard/
+    manifest.json           mounts the backend at /api/plugins/googlehome
+    plugin_api.py           proxies the loopback control API (token stays here)
+    dist/index.js           empty web-dashboard page
   playback.py               what is audible now, and how to stop it
   tools.py                  googlehome_* tools
   notify.py                 one-line task outcomes, speaker-name matching
@@ -641,7 +667,17 @@ docs/REVERSE_ENGINEERING.md protocol findings and the microphone wall
 - The Google Home microphone is not accessible (see above). Voice input needs a
   host microphone.
 - One speaker, one bound profile at a time.
+- **Archived conversations keep receiving turns.** Hermes' router treats
+  `archived` as sidebar state, not as "ended", so a Google Home chat archived in
+  the sidebar can keep receiving turns while no unarchived row lists it. Fixing
+  that needs core changes, not plugin internals:
+  [NousResearch/hermes-agent#154410](https://github.com/NousResearch/hermes-agent/issues/154410).
+- **macOS microphone permission has no SDK verb.** Push-to-talk relies on
+  `getUserMedia()`'s own prompt. If a packaged Desktop needs to ask earlier (or
+  surface a denial clearly), that needs an SDK verb:
+  [NousResearch/hermes-agent#154411](https://github.com/NousResearch/hermes-agent/issues/154411).
 - Casting takes the device over; it will interrupt whatever is playing, and a
   reply takes ~1–3 s to start.
 - Third-party casting is tolerated by Google, not guaranteed. A firmware or
   certificate change can break it (it has broken older Chromecasts before).
+
